@@ -1,0 +1,25 @@
+[package]
+name = "lug-load"
+description = "Load and conformance harness: drives a real lug-server and checks invariants under it"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+lug-proto.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+futures.workspace = true
+hdrhistogram = "7"
+libc = "0.2"
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+toml = "0.8"
+
+[[bin]]
+name = "lug-load"
+path = "src/main.rs"

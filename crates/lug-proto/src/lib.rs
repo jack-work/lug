@@ -109,7 +109,16 @@ impl Request {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Response {
-    Welcome { id: Id, version: u16, max_frame: u32 },
+    /// Answers `Hello` on a socket, and is the first SSE event on a stream.
+    /// `session` is set only over HTTP, where it is the value to send back in
+    /// `X-Lug-Session` so that calls reach this stream.
+    Welcome {
+        id: Id,
+        version: u16,
+        max_frame: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+    },
     /// One version per patch that changed state, in order.
     Ack { id: Id, versions: Vec<Version>, synced: Version },
     /// Pushed on a subscription, contiguous and in version order.

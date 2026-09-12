@@ -9,6 +9,7 @@ members = [
     "crates/lug-server",
     "crates/lug-client",
     "crates/lug-tui",
+    "crates/lug-load",
 ]
 
 [workspace.package]
