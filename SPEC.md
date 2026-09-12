@@ -179,7 +179,15 @@ allow_uid = []                  # additional uids beyond the daemon's own
 segment   = "64MiB"
 ring      = 4096                # records held in memory per log for fan-out
 checkpoint_every = 10000        # versions between automatic checkpoints
+
+[limits]
+connections = 16384             # held at once; past this, refuse, do not queue
 ```
+
+Past `limits.connections` the daemon answers `Code::Backpressure` and hangs
+up, rather than queueing. A queue here only moves the failure somewhere
+harder to see, and the refusal has to say why: a closed socket with no frame
+leaves the peer with a broken pipe and nothing to act on.
 
 `--check` validates config and exits. `lug-server` runs in the foreground and
 logs to stderr; it never forks. The supervisor owns the process.

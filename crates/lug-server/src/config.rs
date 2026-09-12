@@ -9,7 +9,7 @@ pub const USAGE: &str = "\
 lug-server [--config <path>] [--check]
            [--data <dir>] [--run <dir>] [--socket <name>] [--http <addr>]
            [--token <path>] [--allow-uid <uid>] [--segment <size>]
-           [--ring <n>] [--checkpoint-every <n>]";
+           [--ring <n>] [--checkpoint-every <n>] [--connections <n>]";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -81,7 +81,9 @@ pub struct Limits {
     pub push: usize,
     /// Bytes in one pushed frame.
     pub push_bytes: usize,
-    /// Accepted connections.
+    /// Accepted connections held at once. Past this the daemon refuses with
+    /// Code::Backpressure rather than queueing, because a queue here only
+    /// moves the failure somewhere harder to see.
     pub connections: usize,
 }
 
@@ -95,7 +97,7 @@ impl Default for Limits {
             pending: 1024,
             push: 512,
             push_bytes: 4 * 1024 * 1024,
-            connections: 1024,
+            connections: 16384,
         }
     }
 }
@@ -175,6 +177,7 @@ impl Config {
             "checkpoint_every" => self.checkpoint_every = value.parse().map_err(|_| bad(value))?,
             "owner" => self.owner = Some(value.parse().map_err(|_| bad(value))?),
             "cores" => self.cores = Some(value.parse().map_err(|_| bad(value))?),
+            "connections" => self.limits.connections = value.parse().map_err(|_| bad(value))?,
             other => return Err(Error::Unknown(format!("--{other}"))),
         }
         Ok(())

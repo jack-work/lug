@@ -75,12 +75,19 @@ pub async fn accept(mut accept: Accept) {
         };
         if !accept.acl.accepts(uid) {
             tracing::warn!(uid, "rejected connection from foreign uid");
-            tokio::spawn(refuse(stream));
+            tokio::spawn(refuse(stream, Code::Unauthorized, "peer uid is not permitted"));
             continue;
         }
         let Ok(permit) = permits.clone().try_acquire_owned() else {
-            tracing::warn!("connection limit reached");
-            tokio::spawn(refuse(stream));
+            // Logged once per refusal on purpose: a client that cannot tell
+            // why it was dropped will blame the wrong thing, and so will
+            // whoever reads the journal.
+            tracing::warn!(limit = accept.limits.connections, "connection limit reached");
+            tokio::spawn(refuse(
+                stream,
+                Code::Backpressure,
+                "connection limit reached; raise limits.connections",
+            ));
             continue;
         };
 
@@ -96,13 +103,11 @@ pub async fn accept(mut accept: Accept) {
 
 /// Say why before closing: a client that is merely on the wrong uid should
 /// not have to guess.
-async fn refuse(stream: UnixStream) {
+/// Say why before hanging up. A closed socket with no frame leaves the peer
+/// with a broken pipe and nothing to act on.
+async fn refuse(stream: UnixStream, code: Code, message: &str) {
     let mut framed = Framed::new(stream, Codec::<Request, Response>::new());
-    let error = Response::Error {
-        id: 0,
-        code: Code::Unauthorized,
-        message: "peer uid is not permitted".into(),
-    };
+    let error = Response::Error { id: 0, code, message: message.into() };
     let _ = framed.send(error).await;
     let _ = framed.into_inner().shutdown().await;
 }
