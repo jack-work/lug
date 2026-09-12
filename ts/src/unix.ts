@@ -12,6 +12,7 @@ import {
 } from "./subscription.js";
 import type { Transport } from "./transport.js";
 import type { Id, Request, Response } from "./types.js";
+import { isResponse } from "./wire.js";
 
 interface PendingCall {
   resolve: (response: Response) => void;
@@ -309,11 +310,3 @@ function isU32(value: number): boolean {
   return Number.isInteger(value) && value >= 0 && value <= 0xffff_ffff;
 }
 
-function isResponse(value: unknown): value is Response {
-  if (typeof value !== "object" || value === null) {
-    return false;
-  }
-  const id = Reflect.get(value, "id");
-  const tag = Reflect.get(value, "t");
-  return Number.isSafeInteger(id) && typeof tag === "string";
-}

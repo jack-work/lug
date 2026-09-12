@@ -11,6 +11,7 @@ import {
 } from "./subscription.js";
 import type { Transport } from "./transport.js";
 import type { Request, Response } from "./types.js";
+import { isResponse } from "./wire.js";
 
 const CALL_PATH = "/v1/call";
 const STREAM_PATH = "/v1/stream";
@@ -428,15 +429,6 @@ async function readLimited(
     offset += chunk.byteLength;
   }
   return bytes;
-}
-
-function isResponse(value: unknown): value is Response {
-  if (typeof value !== "object" || value === null) {
-    return false;
-  }
-  const id = Reflect.get(value, "id");
-  const tag = Reflect.get(value, "t");
-  return Number.isSafeInteger(id) && typeof tag === "string";
 }
 
 function makeDeferred<T>(): {
