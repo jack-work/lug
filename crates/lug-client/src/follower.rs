@@ -345,7 +345,13 @@ impl Task {
                 }
                 Err(e) => return Err(e),
                 Ok(Response::View { version, value, .. }) => {
-                    self.adopt(version, &value)?;
+                    let snapshot = snapshot_from(version, &value)?;
+                    if self.store.is_some() && snapshot.version() > self.cursor {
+                        // A reconnect preamble can skip patches just like a
+                        // refetch, including one interrupted by a disconnect.
+                        self.emit(Event::Gap { from: self.cursor, to: snapshot.version() }).await;
+                    }
+                    self.adopt(snapshot);
                 }
                 Ok(Response::Records { records, .. }) => {
                     if !self.fold(records).await? {
@@ -364,12 +370,10 @@ impl Task {
 
     /// Rebuild from a view preamble. The server's view is authoritative: it
     /// replaces whatever we held, and the cursor moves to its version.
-    fn adopt(&mut self, version: Version, value: &Value) -> Result<()> {
-        let snapshot = snapshot_from(version, value)?;
+    fn adopt(&mut self, snapshot: Snapshot) {
         self.cursor = snapshot.version();
         self.store = Some(Store::resume(snapshot));
         self.publish(Status::Live);
-        Ok(())
     }
 
     /// Fold a pushed batch. `false` asks for a restart, because the stream no
@@ -426,7 +430,8 @@ impl Task {
         }
         match self.hub.read(&self.log, None).await {
             Ok(view) => {
-                if view.version < to {
+                let snapshot = view.snapshot()?;
+                if snapshot.version() < to {
                     // The view is behind the gap's floor, which can only mean
                     // we raced a truncation; start the whole stream over.
                     return Ok(false);
@@ -436,10 +441,10 @@ impl Task {
                 // because everything in between arrived inside the view.
                 self.emit(Event::Gap {
                     from,
-                    to: view.version,
+                    to: snapshot.version(),
                 })
                 .await;
-                self.adopt(view.version, &view.value)?;
+                self.adopt(snapshot);
                 Ok(true)
             }
             Err(e) if e.is_transient() => Ok(false),
@@ -568,7 +573,7 @@ mod tests {
         };
         let recovery = async {
             task.emit(Event::Gap { from: 2, to: 4 }).await;
-            task.adopt(4, &json!({})).unwrap();
+            task.adopt(snapshot_from(4, &json!({})).unwrap());
         };
         futures::pin_mut!(recovery);
         assert!(futures::poll!(&mut recovery).is_pending(), "recovery published without room for its Gap");

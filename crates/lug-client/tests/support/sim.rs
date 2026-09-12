@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 /// A frame sink for one connection. Immediate replies go out with [`post`];
 /// a pushing task uses [`push`], which waits for room.
@@ -57,6 +57,7 @@ pub struct Sim {
     pub bare_views: AtomicBool,
     /// Never answer these; used to prove a dead connection fails its waiters.
     pub swallow_pings: AtomicBool,
+    pub hold_read: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 impl Default for Sim {
@@ -81,6 +82,7 @@ impl Sim {
             grants: AtomicU64::new(0),
             bare_views: AtomicBool::new(false),
             swallow_pings: AtomicBool::new(false),
+            hold_read: Mutex::new(None),
         }
     }
 
@@ -232,6 +234,10 @@ impl Sim {
                         code: Code::NotReducible,
                         message: format!("{log} keeps no view"),
                     });
+                }
+                if let Some(started) = self.hold_read.lock().unwrap().take() {
+                    let _ = started.send(());
+                    return;
                 }
                 let sim = self.clone();
                 tokio::spawn(async move {

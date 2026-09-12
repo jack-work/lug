@@ -254,33 +254,6 @@ async fn clones_see_the_same_stream() {
 
 #[tokio::test]
 async fn the_gap_is_queued_before_the_refetched_version_wakes_a_renderer() {
-    use futures::task::{ArcWake, waker};
-    use std::future::Future;
-    use std::sync::Mutex;
-    use std::task::Context;
-    use tokio::sync::mpsc;
-
-    struct Renderer {
-        events: Mutex<mpsc::Receiver<Event>>,
-        observations: Mutex<Vec<Vec<Event>>>,
-        follower: lug_client::Follower,
-        views: Mutex<Vec<u64>>,
-    }
-
-    impl ArcWake for Renderer {
-        fn wake_by_ref(this: &Arc<Self>) {
-            // Observe at the notification itself, not after the producer gets
-            // another turn to repair an incorrectly ordered publication.
-            let mut events = this.events.lock().unwrap();
-            let mut available = Vec::new();
-            while let Ok(event) = events.try_recv() {
-                available.push(event);
-            }
-            this.observations.lock().unwrap().push(available);
-            this.views.lock().unwrap().push(this.follower.state().version);
-        }
-    }
-
     let mock = Mock::start("gap-order").await;
     mock.sim.append(&[create("seed", json!(1))]).expect("seed");
     let hub = Hub::builder(mock.transport()).connections(1).connect().await.expect("connect");
@@ -314,4 +287,91 @@ async fn the_gap_is_queued_before_the_refetched_version_wakes_a_renderer() {
         "renderer woke before the recovery Gap was queued: {observations:?}"
     );
     assert_eq!(*renderer.views.lock().unwrap(), vec![3], "version watch woke before the view was published");
+}
+
+use futures::task::{ArcWake, waker};
+use std::future::Future;
+use std::sync::Mutex;
+use std::task::Context;
+use tokio::sync::mpsc;
+
+struct Renderer {
+    events: Mutex<mpsc::Receiver<Event>>,
+    observations: Mutex<Vec<Vec<Event>>>,
+    follower: lug_client::Follower,
+    views: Mutex<Vec<u64>>,
+}
+
+impl ArcWake for Renderer {
+    fn wake_by_ref(this: &Arc<Self>) {
+        // Observe at the notification itself, not after the producer gets
+        // another turn to repair an incorrectly ordered publication.
+        let mut events = this.events.lock().unwrap();
+        let mut available = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            available.push(event);
+        }
+        this.observations.lock().unwrap().push(available);
+        this.views.lock().unwrap().push(this.follower.state().version);
+    }
+}
+
+
+#[tokio::test]
+async fn a_reconnect_preamble_queues_its_gap_before_publishing() {
+    let mock = Mock::start("reconnect-gap-order").await;
+    mock.sim.append(&[create("seed", json!(1))]).expect("seed");
+    let hub = Hub::builder(mock.transport()).connections(1).connect().await.expect("connect");
+    let mut follower = hub.follow("log").await.expect("follow");
+    follower.wait_for(1).await.expect("preamble");
+    mock.kill_connections();
+    loop {
+        if follower.next_change().await.expect("disconnect").status == Status::Reconnecting {
+            break;
+        }
+    }
+    let renderer = Arc::new(Renderer {
+        events: Mutex::new(follower.records().expect("events")),
+        observations: Mutex::new(Vec::new()),
+        follower: follower.clone(),
+        views: Mutex::new(Vec::new()),
+    });
+    let mut versions = follower.changed();
+    versions.borrow_and_update();
+    let notification = versions.changed();
+    futures::pin_mut!(notification);
+    let waker = waker(renderer.clone());
+    assert!(notification.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+    mock.sim.append(&[create("offline", json!(2)), create("after", json!(3))]).expect("offline appends");
+    tokio::time::timeout(Duration::from_secs(5), follower.wait_for(3))
+        .await.expect("reconnect deadline").expect("reconnected");
+    let observations = renderer.observations.lock().unwrap();
+    assert!(
+        observations.first().is_some_and(|events| events.contains(&Event::Gap { from: 1, to: 3 })),
+        "reconnect silently replaced the view: {observations:?}"
+    );
+    assert_eq!(*renderer.views.lock().unwrap(), vec![3]);
+}
+
+#[tokio::test]
+async fn a_gap_survives_connection_death_during_its_refetch() {
+    let mock = Mock::start("interrupted-gap").await;
+    mock.sim.append(&[create("seed", json!(1))]).expect("seed");
+    let hub = Hub::builder(mock.transport()).connections(1).connect().await.expect("connect");
+    let mut follower = hub.follow("log").await.expect("follow");
+    follower.wait_for(1).await.expect("preamble");
+    let mut events = follower.records().expect("events");
+    let (started, refetch) = tokio::sync::oneshot::channel();
+    *mock.sim.hold_read.lock().unwrap() = Some(started);
+    mock.sim.append(&[create("hidden", json!(2))]).expect("hidden");
+    mock.sim.reclaim(2);
+    mock.sim.append(&[create("after", json!(3))]).expect("after");
+    tokio::time::timeout(Duration::from_secs(5), refetch)
+        .await.expect("refetch deadline").expect("refetch started");
+    // The read is now in flight without a response. Death forces recovery
+    // through the next subscription's preamble instead of recover's success arm.
+    mock.kill_connections();
+    tokio::time::timeout(Duration::from_secs(5), follower.wait_for(3))
+        .await.expect("reconnect deadline").expect("recovered");
+    assert_eq!(events.try_recv().expect("the interrupted recovery lost its Gap"), Event::Gap { from: 1, to: 3 });
 }
