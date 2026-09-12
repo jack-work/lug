@@ -66,18 +66,21 @@ reserved  8   zero
 records   ...
 ```
 
-Record:
+Record. A `len` of zero means "no more records": that is what
+preallocated space reads as, and a store must keep everything above its
+logical end zeroed so a failed write can never leave a readable ghost.
+
 
 ```
 len       u32 le    byte length of payload
-crc       u32 le    crc32c over version || payload
+crc       u32 le    CRC-32 (IEEE) over version || payload
 version   u64 le
 payload   len bytes
 ```
 
-Recovery scans the last segment forward and stops at the first short read or
-CRC mismatch, then truncates the file there. A torn tail after a crash is
-normal and is not corruption. Versions must be contiguous across the scan; a
+Recovery scans forward and stops at the first zero length, short read, or CRC
+mismatch, then truncates the file there. A torn tail after a crash is normal
+and is not corruption. Versions must be contiguous across the scan; a
 gap is corruption and must fail loudly.
 
 Header file, written whole to `header.tmp` then renamed over `header`, so it

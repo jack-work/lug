@@ -14,7 +14,7 @@ mod storage;
 mod cavlc_impl;
 
 pub use log::{Durability, Log, LogView};
-pub use reducible::{Noop, Reducible, Versioned};
+pub use reducible::{Noop, Overflow, Reducible, Tick, Versioned};
 pub use storage::{Discard, Record, Recovered, Storage};
 
 /// Monotonic version counter. Every committed patch mints exactly one.

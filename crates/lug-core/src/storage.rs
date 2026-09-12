@@ -9,6 +9,7 @@ pub struct Record {
 }
 
 /// What a cold start found on disk.
+#[derive(Debug)]
 pub struct Recovered<V> {
     /// The checkpointed pointer, if a header was written. `None` means replay
     /// from the structure's own zero value.
@@ -37,8 +38,29 @@ pub trait Storage: Send + 'static {
     type View: Versioned;
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// Append records in version order. Must be atomic per call: either every
-    /// record is recoverable or none is.
+    /// Append records in version order.
+    ///
+    /// Atomicity is over a *prefix*, not the whole call. No file-backed store
+    /// can promise all-or-nothing once a batch outgrows `IOV_MAX` or a write
+    /// returns short, so what is guaranteed is weaker and precise:
+    ///
+    /// - On `Ok`, every record is recoverable.
+    /// - On `Err`, the store is left exactly as it was before the call, as
+    ///   observed through [`load`](Storage::load) and
+    ///   [`read_after`](Storage::read_after). Bytes may have reached the file,
+    ///   but they must not be recoverable as records. The caller may retry the
+    ///   same batch or a different one.
+    /// - After a crash mid-call, a contiguous prefix of the batch may survive.
+    ///   That is sound because the caller's watermark never advanced, so none
+    ///   of those versions was ever acknowledged or observable.
+    ///
+    /// The `Err` case is the sharp one. It is not enough to leave the logical
+    /// end where it was: a later, shorter batch written at that offset can
+    /// leave the tail of the failed batch beyond it, and those bytes are a
+    /// well-formed record at the next contiguous version. Neither a checksum
+    /// nor a gap check would notice. A store must therefore keep everything
+    /// above its logical end unrecoverable, which for a preallocated file
+    /// means keeping it zeroed.
     fn append(&mut self, records: &[Record]) -> Result<(), Self::Error>;
 
     /// Checkpoint the MVCC pointer. Records at or below `view.version()`
