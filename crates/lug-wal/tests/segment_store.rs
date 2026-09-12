@@ -315,6 +315,37 @@ fn a_header_moves_where_replay_starts() {
     assert!(!dir.path().join("header.tmp").exists(), "the temporary header outlived the rename");
 }
 
+/// A checkpoint says "everything up to this version is in the view, do not
+/// bother replaying it". Publishing that by rename before the records it
+/// covers are on stable storage means a crash can leave the claim standing
+/// over records that are not there.
+#[test]
+fn a_checkpoint_is_not_published_before_the_records_it_covers() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut wal = store(dir.path(), 1 << 16);
+    wal.append(&records(1..=10)).expect("append");
+    wal.sync().expect("sync");
+
+    // Written, not flushed, which is the ordinary state of a log between
+    // syncs.
+    wal.append(&records(11..=20)).expect("append");
+    wal.write_header(&Mark(20)).expect("checkpoint");
+
+    let seg = segment_files(dir.path()).remove(0);
+    lug_wal::fault::lose_unsynced(&seg).expect("lose whatever had not reached the platter");
+    lug_wal::fault::clear();
+    drop(wal);
+
+    let mut wal = store(dir.path(), 1 << 16);
+    let Ok(recovered) = wal.load() else {
+        panic!("a header that outran its records left the log unopenable");
+    };
+    assert_eq!(recovered.header, Some(Mark(20)));
+    assert!(recovered.tail.is_empty(), "nothing is above the checkpoint");
+    assert_eq!(versions(&wal.read_after(10, 3).expect("read")), vec![11, 12, 13]);
+    wal.append(&records(21..=22)).expect("the log carries on above the checkpoint");
+}
+
 #[test]
 fn read_after_spans_segment_boundaries() {
     let dir = tempfile::tempdir().expect("tempdir");

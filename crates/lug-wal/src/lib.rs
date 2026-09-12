@@ -475,6 +475,12 @@ impl<V: Versioned> Storage for SegmentStore<V> {
     }
 
     fn write_header(&mut self, view: &V) -> Result<(), Error> {
+        // A header is a claim that recovery may skip every record below it, so
+        // those records have to be on stable storage before the name that
+        // covers them exists. Published first, it survives a crash that the
+        // records it stands over do not.
+        self.sync()?;
+
         let version = view.version();
         let json = serde_json::to_vec(&Header { version, view })?;
         let bytes = header_bytes(&json);
