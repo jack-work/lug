@@ -60,3 +60,30 @@ fn a_checkpoint_lets_recovery_skip_the_records_it_covers() {
     assert!(log.read_after(0, 4).is_err());
     assert_eq!(log.read_after(oldest - 1, 4).expect("read").len(), 4);
 }
+
+/// A sync that fails after the records are written is not a failed write. The
+/// log truncating memory back for it would put the structure *behind* storage,
+/// which is the mirror of the invariant it is protecting: the next append
+/// would mint versions the segment already holds, and every append after that
+/// would be refused.
+#[test]
+fn a_failed_sync_does_not_unwind_records_storage_already_holds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut log = open(dir.path());
+    log.append(&patches(1..=3), Durability::Durable).expect("append");
+
+    lug_wal::fault::fail_syncs(0, 1);
+    let err = log.append(&patches(4..=4), Durability::Durable).expect_err("the sync must fail");
+    lug_wal::fault::clear();
+    assert!(matches!(err, lug_core::Error::Storage(_)), "{err}");
+
+    assert_eq!(log.watermark(), 4, "the record was written, only the flush failed");
+    assert_eq!(log.synced(), 3, "and it is not claimed as durable");
+
+    log.append(&patches(5..=5), Durability::Durable).expect("the log must carry on");
+    assert_eq!(log.synced(), 5);
+    drop(log);
+
+    let log = open(dir.path());
+    assert_eq!(log.watermark(), 5);
+}

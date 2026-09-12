@@ -64,6 +64,7 @@ pub fn zero_range(file: &File, offset: u64, len: u64) -> io::Result<()> {
 
 /// Flush data only. Safe on a preallocated file, where nothing but data moves.
 pub fn fdatasync(file: &File) -> io::Result<()> {
+    fault::check_sync()?;
     retry(|| rustix::fs::fdatasync(file))?;
     fault::synced(file);
     Ok(())
@@ -108,6 +109,7 @@ pub mod fault {
 
     thread_local! {
         static PLAN: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+        static SYNC_PLAN: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
         /// Byte ranges written but not yet flushed, per inode. A power cut may
         /// keep or drop any of them; nothing outside them is at risk.
         static DIRTY: RefCell<HashMap<u64, Vec<(u64, u64)>>> = RefCell::new(HashMap::new());
@@ -119,20 +121,34 @@ pub mod fault {
         PLAN.set((pass, fail));
     }
 
+    /// The same for data flushes, which is what a store's `sync` reaches.
+    pub fn fail_syncs(pass: usize, fail: usize) {
+        SYNC_PLAN.set((pass, fail));
+    }
+
     pub fn clear() {
         PLAN.set((0, 0));
+        SYNC_PLAN.set((0, 0));
         DIRTY.with_borrow_mut(|dirty| dirty.clear());
     }
 
     pub(super) fn check() -> io::Result<()> {
-        match PLAN.get() {
+        step(&PLAN)
+    }
+
+    pub(super) fn check_sync() -> io::Result<()> {
+        step(&SYNC_PLAN)
+    }
+
+    fn step(plan: &'static std::thread::LocalKey<Cell<(usize, usize)>>) -> io::Result<()> {
+        match plan.get() {
             (0, 0) => Ok(()),
             (0, fail) => {
-                PLAN.set((0, fail - 1));
-                Err(io::Error::other("injected write failure"))
+                plan.set((0, fail - 1));
+                Err(io::Error::other("injected failure"))
             }
             (pass, fail) => {
-                PLAN.set((pass - 1, fail));
+                plan.set((pass - 1, fail));
                 Ok(())
             }
         }
@@ -195,6 +211,11 @@ mod fault {
 
     #[inline]
     pub(super) fn check() -> std::io::Result<()> {
+        Ok(())
+    }
+
+    #[inline]
+    pub(super) fn check_sync() -> std::io::Result<()> {
         Ok(())
     }
 
