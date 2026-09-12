@@ -8,6 +8,30 @@
 //! The same frames travel over a unix socket and over HTTP. On HTTP a request
 //! is a POST body and the pushed frames are SSE `data:` lines, so both
 //! transports decode with this one set of types.
+//!
+//! Every request is answered by exactly one frame, except `Subscribe`, which
+//! is answered by one frame and then pushes until cancelled:
+//!
+//! | request | answer |
+//! | --- | --- |
+//! | [`Request::Hello`] | [`Response::Welcome`] |
+//! | [`Request::Append`] | [`Response::Ack`] |
+//! | [`Request::Create`] | [`Response::Logs`] with one entry, the log as it now stands |
+//! | [`Request::List`] | [`Response::Logs`] |
+//! | [`Request::Read`] | [`Response::View`] |
+//! | [`Request::Credit`] | [`Response::Ok`] |
+//! | [`Request::Cancel`] | [`Response::End`] |
+//! | [`Request::Ping`] | [`Response::Pong`] |
+//! | [`Request::Subscribe`] | [`Response::Ok`], then the stream |
+//!
+//! Any of them may instead be answered by [`Response::Error`], which is
+//! always final for that id.
+//!
+//! `Subscribe` is acknowledged *before* anything is pushed, which is what
+//! makes a subscription opened with zero credit distinguishable from one that
+//! failed: exactly one `Ok`, then silence until credit arrives. Over SSE that
+//! acknowledgement is [`Response::Welcome`] instead, because it also has to
+//! carry the session.
 
 mod codec;
 pub mod http;
@@ -75,7 +99,8 @@ pub enum Request {
     },
     /// Extend a stream's credit. Without this the server stops pushing.
     Credit { id: Id, grant: u32 },
-    /// Close a stream. The server answers [`Response::End`].
+    /// Close a stream. The server answers [`Response::End`]. A stream that
+    /// was never opened is [`Code::BadId`], not silence.
     Cancel { id: Id },
     /// Read a materialized view, current or historical.
     Read {
@@ -85,7 +110,8 @@ pub enum Request {
         at: Option<Version>,
     },
     List { id: Id },
-    /// Create a log. Succeeds silently if it already exists with this shape.
+    /// Create a log. Idempotent: an existing log of the same shape succeeds
+    /// and returns its current state, a different shape is [`Code::LogExists`].
     Create { id: Id, log: String, reducible: bool },
     Ping { id: Id },
 }
@@ -130,6 +156,9 @@ pub enum Response {
     /// and the stream resumes at `to`.
     Gap { id: Id, from: Version, to: Version },
     Logs { id: Id, logs: Vec<LogInfo> },
+    /// Accepted, with nothing to report. Answers `Credit`, and opens a
+    /// subscription before any records are pushed.
+    Ok { id: Id },
     /// The stream is closed; the id may be reused.
     End { id: Id },
     Pong { id: Id },
@@ -145,6 +174,7 @@ impl Response {
             | Self::View { id, .. }
             | Self::Gap { id, .. }
             | Self::Logs { id, .. }
+            | Self::Ok { id }
             | Self::End { id }
             | Self::Pong { id }
             | Self::Error { id, .. } => *id,
