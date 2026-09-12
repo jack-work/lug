@@ -11,12 +11,13 @@ import { join } from "node:path";
 import { test } from "node:test";
 import {
   Client,
+  Follower,
   FrameDecoder,
   LugConnectionError,
   LugTimeoutError,
   encodeFrame,
 } from "../src/index.js";
-import type { Request, Response } from "../src/index.js";
+import type { JsonValue, Request, Response } from "../src/index.js";
 
 interface UnixFixture {
   path: string;
@@ -176,6 +177,70 @@ test("unix subscription grants one credit for each record pull", async () => {
     assert.equal(credit, 1);
     await iterator.return?.();
     await cancelled;
+  } finally {
+    await client.close();
+    await fixture.close();
+  }
+});
+
+test("follower takes the view preamble and applies streamed cavlc patches", async () => {
+  const patches: JsonValue[] = [
+    { Create: { profile: { name: "Gluck" }, count: 0 } },
+    { Update: { count: 2, profile: { Update: { name: "Figaro" } } } },
+    { Update: { profile: { Create: { city: "Atlanta" } } } },
+    { Delete: ["profile"] },
+  ];
+  let nextPatch = 0;
+  const fixture = await unixFixture((request, socket) => {
+    if (request.t === "subscribe") {
+      socket.write(
+        encodeFrame({
+          t: "view",
+          id: request.id,
+          version: 0,
+          value: {},
+        } satisfies Response),
+      );
+    } else if (request.t === "credit" && nextPatch < patches.length) {
+      const index = nextPatch;
+      nextPatch += 1;
+      socket.write(
+        encodeFrame({
+          t: "records",
+          id: request.id,
+          records: [{ version: index + 1, patch: patches[index]! }],
+        } satisfies Response),
+      );
+    }
+  });
+  const client = await Client.connect({
+    transport: "unix",
+    path: fixture.path,
+    timeoutMs: 1_000,
+  });
+  let reachedFour!: () => void;
+  const atFour = new Promise<void>((resolve) => {
+    reachedFour = resolve;
+  });
+  const changes: number[] = [];
+  try {
+    const follower = await Follower.follow(client, {
+      log: "state",
+      onChange: (_value, version) => {
+        changes.push(version);
+        if (version === 4) {
+          reachedFour();
+        }
+      },
+    });
+    await atFour;
+    assert.equal(follower.version, 4);
+    assert.deepEqual(follower.value, { count: 2 });
+    assert.deepEqual(changes, [0, 1, 2, 3, 4]);
+    const exposed = follower.value;
+    exposed.count = 99;
+    assert.deepEqual(follower.value, { count: 2 });
+    await follower.close();
   } finally {
     await client.close();
     await fixture.close();

@@ -1,3 +1,5 @@
+export { applyCavlcPatch, CavlcPatchError } from "./cavlc.js";
+export type { CavlcPatch, CavlcUpdate, JsonObject } from "./cavlc.js";
 export { Client } from "./client.js";
 export type {
   ClientOptions,
@@ -5,6 +7,8 @@ export type {
   UnixClientOptions,
 } from "./client.js";
 export { FrameDecoder, FrameError, MAX_FRAME, encodeFrame } from "./codec.js";
+export { Follower } from "./follower.js";
+export type { FollowerOptions } from "./follower.js";
 export {
   LugClientError,
   LugConnectionError,
