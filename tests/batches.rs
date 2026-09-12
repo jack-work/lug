@@ -15,7 +15,7 @@ fn apply(store: &mut Store, value: Json) {
 }
 
 #[test]
-fn every_property_requires_create_and_parents_are_never_implicit() {
+fn updates_require_existing_properties_and_parents() {
     let mut store = Store::new();
     assert!(store.apply(&update("count", json!(1))).is_err());
     assert!(
@@ -48,11 +48,8 @@ fn every_property_requires_create_and_parents_are_never_implicit() {
 }
 
 #[test]
-fn reject_bulk_objects_old_operations_and_malformed_patches() {
+fn reject_old_operations_and_malformed_patches() {
     for invalid in [
-        json!({"Create":{"profile":{"test":"test"}}}),
-        json!({"Create":{"profile":{"child":{}}}}),
-        json!({"Update":{"profile":{"Create":{"child":{"name":"x"}}}}}),
         json!({"Update":{"profile":{"name":"x"}}}),
         json!({"Set":{"a":1}}),
         json!({"object":{"Create":{"a":1}}}),
@@ -75,12 +72,15 @@ fn reject_bulk_objects_old_operations_and_malformed_patches() {
 }
 
 #[test]
-fn rust_api_cannot_bypass_explicit_creation() {
+fn rust_api_accepts_initialized_creates_but_not_object_replacement() {
     let bulk = Patch {
         create: [("p".into(), Value::from(json!({"child":1})))].into(),
         ..Default::default()
     };
-    assert!(bulk.apply(&Value::default()).is_err());
+    assert_eq!(
+        bulk.apply(&Value::default()).unwrap().to_json(),
+        json!({"p":{"child":1}})
+    );
     let replacement = Patch {
         update: [("p".into(), Update::Value(Value::from(json!({"child":1}))))].into(),
         ..Default::default()
@@ -486,4 +486,80 @@ fn writer_domains_can_be_locked_and_partitioned_independently() {
         .apply(&create("unrelated", json!(true)))
         .unwrap();
     other.apply_batch(tx).unwrap();
+}
+
+#[test]
+fn create_initializes_editable_subtrees_and_replay_preserves_them() {
+    let mut store = Store::new();
+    let initial = json!({"name":"Gluck","nested":{"count":1,"empty":{}},"array":[1,null],"Create":{"literal":true},"a.b":2});
+    let creation = create("profile", initial.clone());
+    let before = store.snapshot();
+    let created = store.apply(&creation).unwrap().snapshot;
+    assert_eq!(created.root().get("profile").unwrap().to_json(), initial);
+    assert!(
+        created
+            .root()
+            .get("profile")
+            .unwrap()
+            .ptr_eq(&creation.create["profile"])
+    );
+    assert_eq!(before.root().to_json(), json!({}));
+    apply(
+        &mut store,
+        json!({"Update":{"profile":{"Update":{"name":"Figaro","nested":{"Update":{"count":2}}}}}}),
+    );
+    apply(
+        &mut store,
+        json!({"Update":{"profile":{"Create":{"new":{"child":3}}}}}),
+    );
+    apply(
+        &mut store,
+        json!({"Update":{"profile":{"Update":{"nested":{"Delete":["count"]}}}}}),
+    );
+    assert_eq!(created.root().get("profile").unwrap().to_json(), initial);
+    assert_eq!(
+        store
+            .snapshot()
+            .root()
+            .at(["profile", "new", "child"])
+            .unwrap()
+            .as_atom(),
+        Some(&json!(3))
+    );
+    assert!(
+        store
+            .snapshot()
+            .root()
+            .at(["profile", "nested", "count"])
+            .is_none()
+    );
+    apply(&mut store, json!({"Delete":["profile"]}));
+    assert_eq!(store.snapshot().root().to_json(), json!({}));
+    assert!(
+        store
+            .apply(&patch(
+                json!({"Update":{"profile":{"Create":{"late":true}}}})
+            ))
+            .is_err()
+    );
+    let replay = Store::replay(Value::default(), store.log().to_vec()).unwrap();
+    for version in 0..=store.snapshot().version() {
+        assert_eq!(
+            store.snapshot_at(version).unwrap().root(),
+            replay.snapshot_at(version).unwrap().root()
+        );
+    }
+}
+
+#[test]
+fn initialized_create_does_not_overwrite_or_partially_publish() {
+    let mut store = Store::new();
+    store
+        .apply(&create("profile", json!({"name":"Gluck"})))
+        .unwrap();
+    let before = store.snapshot();
+    let replacement = patch(json!({"Create":{"a":{"would":"be new"},"profile":{"name":"Figaro"}}}));
+    assert!(store.apply(&replacement).is_err());
+    assert!(before.root().ptr_eq(store.snapshot().root()));
+    assert_eq!(store.log().len(), 1);
 }

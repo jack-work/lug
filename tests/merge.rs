@@ -76,7 +76,7 @@ fn empty_patch_is_identity_and_disjoint_merge_is_associative() {
 #[test]
 fn merge_validates_programmatic_patches() {
     let invalid = Patch {
-        create: [("p".into(), Value::from(json!({"child":1})))].into(),
+        delete: vec!["p".into(), "p".into()],
         ..Default::default()
     };
     assert!(matches!(
@@ -86,5 +86,25 @@ fn merge_validates_programmatic_patches() {
     assert!(matches!(
         Patch::default().merge(&invalid),
         Err(Error::InvalidPatch(_))
+    ));
+}
+
+#[test]
+fn merge_preserves_initialized_subtrees() {
+    let a = patch(json!({"Create":{"a":{"name":"Gluck"}}}));
+    let b = patch(json!({"Create":{"b":{"count":1}}}));
+    let merged = a.merge(&b).unwrap();
+    assert_eq!(
+        merged.apply(&Value::default()).unwrap().to_json(),
+        json!({"a":{"name":"Gluck"},"b":{"count":1}})
+    );
+    assert_eq!(
+        serde_json::from_str::<Patch>(&serde_json::to_string(&merged).unwrap()).unwrap(),
+        merged
+    );
+    let same_parent = patch(json!({"Create":{"a":{"different":true}}}));
+    assert!(matches!(
+        a.merge(&same_parent),
+        Err(Error::MergeConflict { .. })
     ));
 }

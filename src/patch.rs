@@ -25,8 +25,8 @@ impl TryFrom<serde_json::Value> for Update {
     }
 }
 
-/// Object edits with explicit creation of every property. Create accepts
-/// leaves or empty objects only. Delete removes keys and their subtrees.
+/// Object edits. Create initializes an absent property with any JSON value.
+/// Update edits existing nodes. Delete removes keys and their subtrees.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     try_from = "BTreeMap<String, serde_json::Value>",
@@ -85,13 +85,6 @@ impl Patch {
             if !keys.insert(key) {
                 return Err(Error::InvalidPatch(format!(
                     "multiple operations for {key:?}"
-                )));
-            }
-        }
-        for (key, value) in &self.create {
-            if value.as_object().is_some_and(|object| !object.is_empty()) {
-                return Err(Error::InvalidPatch(format!(
-                    "Create {key:?}: create an empty object, then Create each child"
                 )));
             }
         }

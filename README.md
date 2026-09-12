@@ -16,26 +16,24 @@ cargo run -p cavlc-demo
 Enter these lines individually:
 
 ```text
-{"Create":{"profile":{},"count":0}}
-{"Update":{"profile":{"Create":{"name":"Gluck","address":{}}}}}
-{"Update":{"profile":{"Update":{"address":{"Create":{"city":"Atlanta"}}}}}}
+{"Create":{"profile":{"name":"Gluck","address":{"city":"Atlanta"}},"count":0}}
 {"Update":{"count":2,"profile":{"Update":{"name":"Figaro"}}}}
 {"Update":{"profile":{"Update":{"address":{"Delete":["city"]}}}}}
 {"Delete":["profile"]}
-:show 3
+:show 1
 :log
 ```
 
-The six patches produce versions 1 through 6. Every command redraws the current
-snapshot, including errors. `:show 3` also displays history; it does not move the
+The four patches produce versions 1 through 4. Every command redraws the current
+snapshot, including errors. `:show 1` also displays history; it does not move the
 current version. `:log` shows committed batches.
 
 A batch lets several patches publish together:
 
 ```text
 :batch
-{"Create":{"profile":{}}}
-{"Update":{"profile":{"Create":{"name":"Gluck"}}}}
+{"Create":{"profile":{"name":"Gluck"}}}
+{"Update":{"profile":{"Update":{"name":"Figaro"}}}}
 :apply
 :quit
 ```
@@ -68,23 +66,27 @@ The patch itself is an object, with no wrapper or type tags.
 
 | Operation | Meaning |
 | --- | --- |
-| `{"Create":{"key":value}}` | Create an absent property. Value must be a leaf or `{}`. |
+| `{"Create":{"key":value}}` | Initialize an absent property with any JSON value, including a subtree. |
 | `{"Update":{"key":value}}` | Replace an existing leaf. |
 | `{"Update":{"key":patch}}` | Descend into an existing object. |
 | `{"Delete":["key"]}` | Remove an existing property and its entire subtree. |
 
 `{}` is a no-op. There is no `Set`. No operation supplies or matches old values.
 
-Every property requires `Create`. To build `profile.name`, create `profile`
-as `{}`, then use `Update` to reach it and `Create` to add `name`. Bulk creation
-such as `{"Create":{"profile":{"name":"Gluck"}}}` is rejected. Parents are
-never inferred. A patch can operate on several distinct keys, but cannot have
-multiple operations on the same key; use consecutive patches in a batch.
+`Create` initializes a new property and any children in its value. For example,
+`{"Create":{"profile":{"name":"Gluck"}}}` creates both `profile` and
+`profile.name`. Those children are normal addressable nodes, not opaque data.
+To add a child to an existing object, use nested `Create` through `Update`.
+Parents on an `Update` path must already exist; they are never inferred.
+
+Creation is not replacement: `Create` fails if the property already exists.
+A patch can operate on several distinct keys, but cannot have multiple
+operations on the same key; use consecutive patches in a batch.
 
 Objects in `Update` always contain operations, never replacement object data.
 Updating a leaf with an object patch, or an object with a leaf value, is an
 error. Changing between those two kinds requires `Delete` followed by `Create`.
-That prevents whole-object replacement from bypassing property creation.
+An initialized object is accepted by `Create`, not as an `Update` replacement.
 
 An inner deletion is wrapped in one `Update` per ancestor. Deleting the last
 child leaves its parent as `{}`. Deleting the parent removes all children at
@@ -116,9 +118,8 @@ A single `Store::apply(patch)` targets the current state. Callers handling stale
 remote intent can compare their version with `batch.base().version()` before
 applying patches. Publication checks that the batch base is still current.
 
-A successful batch records its ordered state-changing patches, not a
-folded bulk subtree. This preserves every explicit `Create` and delete/recreate
-boundary. Equal-value updates and empty patches are skipped. Once a batch
+A successful batch records its ordered state-changing patches. Initial subtree
+values stay in their `Create` record, and delete/recreate boundaries are kept. Equal-value updates and empty patches are skipped. Once a batch
 has made changes, it advances the version even if later edits restore the same
 JSON. A failed patch leaves earlier staged edits intact; abort the batch
 to discard those. `apply_batch` consumes the batch, including on conflict.
@@ -199,8 +200,8 @@ may still need a decision. No text merge algorithm is implemented here.
 - `Patch` / `Update`: pure checked operations. No I/O or serialization in edits.
 - `Store`: private working roots, versioned `Snapshot`s, and ordered `Commit`s.
 
-Committing no longer diffs the entire state or synthesizes bulk creates. Snapshot
-rendering is confined to the demo and costs proportional to its size.
+Publication does not diff the entire state. Snapshot rendering is confined to
+the demo and costs proportional to its size.
 
 ```rust
 use cavlc::{Patch, Store};

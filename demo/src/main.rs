@@ -14,7 +14,7 @@ Enter one object patch per line (not RFC 6902).
 Create a key: {\"Create\":{\"count\":0}}
 Update it:   {\"Update\":{\"count\":1}}
 Delete it:   {\"Delete\":[\"count\"]}
-Create objects as {}; create each child explicitly through nested Updates.
+Create can initialize a whole subtree: {\"Create\":{\"profile\":{\"name\":\"Gluck\"}}}
 Update requires an existing path. Delete removes the whole subtree.
 
 :batch         start a private batch

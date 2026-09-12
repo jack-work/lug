@@ -117,24 +117,27 @@ fn create_then_update_and_delete_without_old_values() {
 }
 
 #[test]
-fn explicit_children_nested_delete_and_no_resurrection() {
-    let (status, lines, _) = run(r#"{"Create":{"profile":{"name":"wrong"}}}
-{"Create":{"profile":{}}}
-{"Update":{"profile":{"Create":{"nested":{}}}}}
-{"Update":{"profile":{"Update":{"nested":{"Create":{"name":"Gluck","remove":true}}}}}}
+fn initialized_children_nested_delete_and_no_resurrection() {
+    let (status, lines, _) = run(
+        r#"{"Create":{"profile":{"nested":{"name":"Gluck","remove":true}}}}
+{"Update":{"profile":{"Update":{"nested":{"Update":{"name":"Figaro"}}}}}}
 {"Update":{"profile":{"Update":{"nested":{"Delete":["remove"]}}}}}
 {"Delete":["profile"]}
 {"Update":{"profile":{"Create":{"late":true}}}}
-"#);
-    assert_eq!(status.code(), Some(1));
-    assert_eq!(lines[0]["ok"], false);
-    assert_eq!(lines[0]["snapshot"], serde_json::json!({}));
-    assert_eq!(
-        lines[4]["snapshot"],
-        serde_json::json!({"profile":{"nested":{"name":"Gluck"}}})
+"#,
     );
-    assert_eq!(lines[5]["snapshot"], serde_json::json!({}));
-    assert_eq!(lines[6]["ok"], false);
-    assert_eq!(lines[6]["version"], 5);
-    assert_eq!(lines[6]["snapshot"], serde_json::json!({}));
+    assert_eq!(status.code(), Some(1));
+    assert_eq!(lines[0]["ok"], true);
+    assert_eq!(
+        lines[0]["snapshot"],
+        serde_json::json!({"profile":{"nested":{"name":"Gluck","remove":true}}})
+    );
+    assert_eq!(
+        lines[2]["snapshot"],
+        serde_json::json!({"profile":{"nested":{"name":"Figaro"}}})
+    );
+    assert_eq!(lines[3]["snapshot"], serde_json::json!({}));
+    assert_eq!(lines[4]["ok"], false);
+    assert_eq!(lines[4]["version"], 4);
+    assert_eq!(lines[4]["snapshot"], serde_json::json!({}));
 }
