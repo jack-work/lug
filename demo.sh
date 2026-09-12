@@ -51,11 +51,31 @@ run() {
 }
 
 say "building"
-cargo build --release -q --bin lug-server --bin lug || die "build failed"
+cargo build --release -q --workspace || die "build failed"
 SERVER="$ROOT/target/release/lug-server"
 LUG="$ROOT/target/release/lug"
-[ -x "$SERVER" ] || die "no lug-server at $SERVER"
-[ -x "$LUG" ] || die "no lug at $LUG"
+
+# Name the missing piece instead of letting cargo complain about a bin target,
+# because during the build-out the honest answer is "not written yet".
+missing=
+[ -x "$SERVER" ] || missing="$missing lug-server"
+[ -x "$LUG" ] || missing="$missing lug"
+if [ -n "$missing" ]; then
+	cat >&2 <<-EOF
+		$PROG: not built yet:$missing
+
+		This script is the acceptance test for the daemon and its CLI, and it
+		is written ahead of them on purpose. What does work today:
+
+		  cargo test --workspace
+		  cargo run -p cavlc-demo          the local REPL, no daemon
+		  (cd ts && npm test)              the TypeScript client
+	EOF
+	[ -x "$ROOT/target/release/lug-load" ] &&
+		printf '  target/release/lug-load --smoke   once lug-server exists
+' >&2
+	exit 1
+fi
 
 DIR=$(mktemp -d /tmp/lug-demo.XXXXXX)
 SOCK="$DIR/run/lug.sock"

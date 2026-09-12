@@ -193,6 +193,32 @@ pub struct Record {
     pub patch: Value,
 }
 
+/// What a subscriber observes, in order.
+///
+/// A gap is part of the stream, not an error beside it. A subscription that
+/// handed out bare records would force every consumer to either recompute
+/// contiguity itself or quietly present a jump in versions as if nothing
+/// happened, and a viewer that lies about contiguity is worse than one that
+/// says records 40 through 91 are gone.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "t", rename_all = "snake_case")]
+pub enum Event {
+    Record(Record),
+    /// Versions in `(from, to]` were reclaimed before this subscriber reached
+    /// them. The stream resumes at `to`; nothing in the range is recoverable.
+    Gap { from: Version, to: Version },
+}
+
+impl Event {
+    /// The version this event leaves the cursor at.
+    pub fn cursor(&self) -> Version {
+        match self {
+            Self::Record(record) => record.version,
+            Self::Gap { to, .. } => *to,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LogInfo {
     pub name: String,
