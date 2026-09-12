@@ -42,7 +42,11 @@ pub struct Ack {
     pub synced: Version,
 }
 
-/// A materialized view as the server sent it.
+/// A materialized view: the document itself at the version it holds.
+///
+/// The wire may carry a view as a serialized snapshot, as a log view wrapping
+/// one, or as the bare document. All three land here as the document, so a
+/// caller never has to know which shape the server chose.
 #[derive(Clone, Debug, PartialEq)]
 pub struct View {
     pub version: Version,
@@ -50,10 +54,22 @@ pub struct View {
 }
 
 impl View {
-    /// Read this view as a [`cavlc::Snapshot`], the form a
-    /// [`Follower`] folds patches into.
+    pub(crate) fn unwrap_frame(version: Version, value: Value) -> Self {
+        match crate::follower::snapshot_from(version, &value) {
+            Ok(snapshot) => Self {
+                version: snapshot.version(),
+                value: snapshot.root().to_json(),
+            },
+            // Not a shape a reducible view takes, so hand back what arrived.
+            Err(_) => Self { version, value },
+        }
+    }
+
+    /// Read this view as a [`cavlc::Snapshot`], the form a [`Follower`] folds
+    /// patches into.
     pub fn snapshot(&self) -> Result<cavlc::Snapshot> {
-        crate::follower::snapshot_from(self.version, &self.value)
+        cavlc::Snapshot::new(self.version, cavlc::Value::from(self.value.clone()))
+            .map_err(Error::View)
     }
 }
 
@@ -251,7 +267,7 @@ impl Hub {
             })
             .await?;
         match reply {
-            Response::View { version, value, .. } => Ok(View { version, value }),
+            Response::View { version, value, .. } => Ok(View::unwrap_frame(version, value)),
             other => Err(mismatch("view", other)),
         }
     }

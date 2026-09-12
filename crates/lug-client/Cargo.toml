@@ -31,4 +31,4 @@ path = "src/bin/lug.rs"
 required-features = ["cli"]
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util", "process"] }

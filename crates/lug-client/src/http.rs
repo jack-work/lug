@@ -494,6 +494,40 @@ mod tests {
         assert!(Endpoint::parse("127.0.0.1:7717", "t").is_err());
     }
 
+    async fn body_of(head: &str, chunked: bool, length: Option<usize>) -> Vec<u8> {
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(head.as_bytes().to_vec()));
+        Body::new(reader, chunked, length)
+            .read_all()
+            .await
+            .expect("body")
+    }
+
+    #[tokio::test]
+    async fn bodies_decode_however_they_are_framed() {
+        // Content-Length, which is how a call comes back.
+        assert_eq!(
+            body_of("{\"t\":\"pong\"}", false, Some(12)).await,
+            b"{\"t\":\"pong\"}"
+        );
+        // Chunked, which is how a real server sends an event stream.
+        let chunked = "5\r\nhello\r\n1\r\n!\r\n0\r\n\r\n";
+        assert_eq!(body_of(chunked, true, None).await, b"hello!");
+        // Neither, meaning the body runs to the end of the connection.
+        assert_eq!(body_of("loose", false, None).await, b"loose");
+    }
+
+    #[tokio::test]
+    async fn sse_lines_come_out_of_chunks_whole() {
+        let stream = "8\r\ndata: {}\r\n3\r\n\n\n:\r\n0\r\n\r\n";
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(stream.as_bytes().to_vec()));
+        let mut body = Body::new(reader, true, None);
+        assert_eq!(
+            body.next_line().await.expect("line"),
+            Some("data: {}".into())
+        );
+        assert_eq!(body.next_line().await.expect("line"), Some(String::new()));
+    }
+
     #[test]
     fn log_names_survive_the_query() {
         assert_eq!(

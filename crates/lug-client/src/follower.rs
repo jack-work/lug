@@ -508,3 +508,35 @@ pub(crate) fn snapshot_from(version: Version, value: &Value) -> Result<Snapshot>
     }
     Snapshot::new(version, cavlc::Value::from(value.clone())).map_err(Error::View)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Servers have three reasonable ways to put a view on the wire, and a
+    /// follower that only understood one of them would be brittle for no
+    /// reason.
+    #[test]
+    fn a_view_is_read_in_any_of_its_shapes() {
+        let document = json!({ "title": "lug" });
+
+        let bare = snapshot_from(7, &document).expect("bare root");
+        assert_eq!(bare.version(), 7);
+        assert_eq!(bare.root().to_json(), document);
+
+        let snapshot = json!({ "version": 3, "root": document });
+        let parsed = snapshot_from(9, &snapshot).expect("serialized snapshot");
+        assert_eq!(parsed.version(), 3, "the payload's own version wins");
+        assert_eq!(parsed.root().to_json(), document);
+
+        let log_view = json!({ "view": { "version": 4, "root": document }, "synced": 4 });
+        let parsed = snapshot_from(9, &log_view).expect("log view");
+        assert_eq!(parsed.version(), 4);
+    }
+
+    #[test]
+    fn a_view_that_is_not_an_object_is_refused() {
+        assert!(snapshot_from(1, &json!(12)).is_err());
+    }
+}

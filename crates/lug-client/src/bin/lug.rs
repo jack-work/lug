@@ -433,12 +433,7 @@ async fn read(hub: &Hub, out: &Output, log: &str, at: Option<Version>) -> Result
         return out
             .line(serde_json::json!({ "version": view.version, "value": view.value }).to_string());
     }
-    let body = match view.snapshot() {
-        Ok(snapshot) => snapshot.root().to_json(),
-        // Not a shape the follower understands, so print what arrived.
-        Err(_) => view.value.clone(),
-    };
-    out.line(out.value(&body))
+    out.line(out.value(&view.value))
 }
 
 async fn tail(hub: &Hub, log: &str, from: Version, follow: bool, credit: u32) -> Result<(), Fail> {
