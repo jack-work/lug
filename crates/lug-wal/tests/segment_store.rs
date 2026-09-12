@@ -526,3 +526,17 @@ fn a_second_store_on_the_same_directory_is_refused() {
     let mut second = store(dir.path(), 1 << 16);
     assert_eq!(versions(&second.load().expect("load").tail), vec![1, 2, 3]);
 }
+
+/// A record at the top of the counter leaves no next version, and the append
+/// path adds one to it while validating the batch. In release that wraps the
+/// expectation back to zero, and in debug it takes the process down.
+#[test]
+fn the_last_version_the_counter_holds_is_refused_rather_than_wrapping() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut wal = store(dir.path(), 1 << 16);
+    wal.write_header(&Mark(Version::MAX - 1)).expect("checkpoint at the end of the counter");
+
+    let err = wal.append(&records(Version::MAX..=Version::MAX)).expect_err("no room above it");
+    assert!(matches!(err, Error::Exhausted { version: Version::MAX }), "{err}");
+    assert_eq!(wal.oldest(), Version::MAX);
+}

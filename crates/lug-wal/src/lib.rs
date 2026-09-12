@@ -122,6 +122,8 @@ pub enum Error {
     Poisoned { path: PathBuf, offset: u64 },
     #[error("{dir} is already open: a log directory has exactly one writer")]
     Locked { dir: PathBuf },
+    #[error("version {version} is the last the counter holds, and the log needs a version above it")]
+    Exhausted { version: Version },
 }
 
 impl Error {
@@ -429,9 +431,14 @@ impl<V: Versioned> Storage for SegmentStore<V> {
                     max: format::MAX_PAYLOAD,
                 });
             }
-            expected += 1;
+            // Taking the top of the counter would leave the store with no
+            // next version to name, and every offset arithmetic below assumes
+            // one exists.
+            let Some(next) = expected.checked_add(1) else {
+                return Err(Error::Exhausted { version: record.version });
+            };
+            expected = next;
         }
-
         let rotating = match self.segments.last() {
             Some(segment) => segment.end >= self.rotate_bytes,
             None => true,
@@ -555,6 +562,6 @@ impl<V: Versioned> Storage for SegmentStore<V> {
     }
 
     fn oldest(&self) -> Version {
-        self.segments.first().map_or(self.header_version + 1, |s| s.first)
+        self.segments.first().map_or(self.header_version.saturating_add(1), |s| s.first)
     }
 }
