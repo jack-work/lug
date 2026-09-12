@@ -56,7 +56,9 @@ A log is a directory of segments plus one header file.
 <data>/<log>/000000000000000001.seg
 ```
 
-Segment name is the zero-padded version of its first record, 18 digits.
+Segment name is the zero-padded version of its first record, at least 18
+digits. Parse a wider name: padding is a minimum, and a log that rotates past
+10^18 writes a nineteenth digit it must still be able to read back.
 
 Segment file:
 
