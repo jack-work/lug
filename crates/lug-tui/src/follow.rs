@@ -16,10 +16,13 @@ pub struct View {
 }
 
 pub trait Follow: Send + 'static {
-    /// The current view, or `None` when the log is not reducible.
+    /// Whether this log has a view to render at all.
+    fn reducible(&self) -> bool;
+
+    /// The current view, `None` on a log that is not reducible.
     ///
     /// Must be cheap: it is called from the render loop. A reducible source is
-    /// required to have its first view in hand before it is handed over.
+    /// expected to have its first view in hand before it is handed over.
     fn view(&self) -> Option<View>;
 
     /// Ticks on every version advance, reducible or not. `*rx.borrow()` is the

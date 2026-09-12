@@ -63,6 +63,7 @@ struct Range {
 }
 
 pub struct Script {
+    reducible: bool,
     view: Arc<Mutex<Option<View>>>,
     version: watch::Receiver<Version>,
     events: Option<mpsc::Receiver<Event>>,
@@ -94,6 +95,7 @@ impl Script {
             .context("spawning the script tail thread")?;
 
         Ok(Self {
+            reducible: header.reducible,
             view,
             version: version_rx,
             events: Some(event_rx),
@@ -102,6 +104,10 @@ impl Script {
 }
 
 impl Follow for Script {
+    fn reducible(&self) -> bool {
+        self.reducible
+    }
+
     fn view(&self) -> Option<View> {
         self.view.lock().expect("script view mutex poisoned").clone()
     }
