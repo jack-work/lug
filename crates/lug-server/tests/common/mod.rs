@@ -5,7 +5,7 @@
 use futures::{SinkExt, StreamExt};
 use lug_proto::{Codec, Id, Request, Response};
 use lug_server::config::{Config, Limits};
-use lug_server::{MemoryFactory, Server};
+use lug_server::{MemoryFactory, Segments, Server};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::net::UnixStream;
@@ -27,6 +27,13 @@ impl Harness {
     /// `retain` is how many records the in-memory storage keeps, which is what
     /// makes retention and Gap reachable from a test.
     pub async fn with(tweak: impl FnOnce(&mut Config), retain: usize) -> Self {
+        let (mut harness, config) = Self::configured(tweak);
+        harness.server =
+            Some(Server::start(config, MemoryFactory::new(retain)).await.expect("server starts"));
+        harness
+    }
+
+    fn configured(tweak: impl FnOnce(&mut Config)) -> (Self, Config) {
         let dir = tempfile::tempdir().expect("tempdir");
         let token = "s3cr3t-not-logged".to_string();
         let token_path = dir.path().join("token");
@@ -42,9 +49,16 @@ impl Harness {
             ..Config::default()
         };
         tweak(&mut config);
-        let server =
-            Server::start(config, MemoryFactory::new(retain)).await.expect("server starts");
-        Self { server: Some(server), dir, token }
+        (Self { server: None, dir, token: token.clone() }, config)
+    }
+
+    /// The daemon on segment files, where a sync is a real fdatasync.
+    pub async fn durable() -> Self {
+        let (mut harness, config) = Self::configured(|_| {});
+        let storage = Segments::new(config.data.clone(), config.segment.0);
+        harness.server =
+            Some(Server::start(config, storage).await.expect("server starts"));
+        harness
     }
 
     pub fn server(&self) -> &Server {

@@ -34,7 +34,17 @@ async fn an_idle_append_is_one_batch_and_one_sync() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn group_commit_amortizes_the_sync_under_load() {
-    let lug = Harness::start().await;
+    measure(Harness::start().await, "memory").await;
+}
+
+/// The same measurement where a sync is a real fdatasync on a segment file,
+/// which is the cost group commit exists to spread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn group_commit_amortizes_a_real_fdatasync() {
+    measure(Harness::durable().await, "segments").await;
+}
+
+async fn measure(lug: Harness, storage: &str) {
     lug.with_log("load", false).await;
 
     let connections = 32;
@@ -82,7 +92,7 @@ async fn group_commit_amortizes_the_sync_under_load() {
     let per_sync = folded as f64 / syncs as f64;
     let syncs_per_append = syncs as f64 / folded as f64;
     println!(
-        "{total} patches over {connections} connections in {elapsed:?}: \
+        "{storage}: {total} patches over {connections} connections in {elapsed:?}: \
          {batches} batches, {syncs} syncs, {per_sync:.1} patches per sync, \
          {syncs_per_append:.4} syncs per append, \
          {:.0} patches/s",
