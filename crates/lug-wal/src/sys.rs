@@ -77,6 +77,17 @@ pub fn fsync(file: &File) -> io::Result<()> {
     Ok(())
 }
 
+/// Take the directory's exclusive advisory lock without waiting, reporting
+/// `false` if someone else holds it. The lock lives on the handle, so it goes
+/// away when the store is dropped or the process dies, crash included.
+pub fn try_lock_dir(dir: &File) -> io::Result<bool> {
+    match rustix::fs::flock(dir, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(true),
+        Err(Errno::WOULDBLOCK) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Publish `to` by renaming `from` over it, both relative to an open
 /// directory. `rename` is atomic, so a reader sees the old file or the new one
 /// and never a half written one.

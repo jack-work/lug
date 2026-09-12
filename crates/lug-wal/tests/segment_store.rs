@@ -504,3 +504,25 @@ fn a_segment_named_past_eighteen_digits_is_still_found() {
     let mut wal = store(dir.path(), 32);
     assert_eq!(versions(&wal.load().expect("load").tail), (HIGH..=HIGH + 3).collect::<Vec<_>>());
 }
+
+/// Nothing stopped two stores from opening the same directory, and each one
+/// kept its own idea of where the records end. The second writes at the
+/// offset the first already used, so records the first acknowledged are
+/// overwritten and never come back.
+#[test]
+fn a_second_store_on_the_same_directory_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut first = store(dir.path(), 1 << 16);
+    first.append(&records(1..=3)).expect("append");
+    first.sync().expect("sync");
+
+    let err = SegmentStore::<Mark>::open_with(dir.path(), Options { rotate_bytes: 1 << 16 })
+        .err()
+        .expect("a log directory has exactly one writer");
+    assert!(matches!(err, Error::Locked { .. }), "{err}");
+
+    // The lock goes with the handle, so the next owner gets in.
+    drop(first);
+    let mut second = store(dir.path(), 1 << 16);
+    assert_eq!(versions(&second.load().expect("load").tail), vec![1, 2, 3]);
+}

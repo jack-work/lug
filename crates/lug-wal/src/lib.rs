@@ -120,6 +120,8 @@ pub enum Error {
         "{path} is poisoned: bytes above offset {offset} may replay as records nobody was told about, so appending is refused until the store is reopened"
     )]
     Poisoned { path: PathBuf, offset: u64 },
+    #[error("{dir} is already open: a log directory has exactly one writer")]
+    Locked { dir: PathBuf },
 }
 
 impl Error {
@@ -177,6 +179,12 @@ impl<V: Versioned> SegmentStore<V> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir).map_err(Error::at(&dir))?;
         let dir_handle = File::open(&dir).map_err(Error::at(&dir))?;
+        // Each store keeps its own idea of where the records end, so a second
+        // one writes over the tail the first already acknowledged, and the
+        // records in between are lost with nothing to show for it.
+        if !sys::try_lock_dir(&dir_handle).map_err(Error::at(&dir))? {
+            return Err(Error::Locked { dir });
+        }
         let mut store = Self {
             dir,
             dir_handle,
