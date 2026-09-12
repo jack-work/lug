@@ -8,12 +8,19 @@ existing credential file is read. HTTP uses loopback and a fresh token.
 
 ```sh
 cargo build --release -p lug-load -p lug-server
+./target/release/lug-load --smoke
 cargo run --release -p lug-load -- --server ./target/release/lug-server \
   --connections 10000 --logs 8 --appenders-per-log 4 \
   --subscribers-per-log 4 --rate 10000 --duration 60 --json
 cargo run --release -p lug-load -- --server ./target/release/lug-server \
   --transport http --connections 100 --soak --soak-cycles 20
 ```
+
+`--smoke` runs one connection, log, appender and subscriber, with 20 durable
+appends in a one-second scheduling window. It also runs credit isolation and
+SIGKILL/replay, takes a few seconds, and prints four result lines. It cannot
+be combined with `--soak`. The server is found beside lug-load first, then
+in PATH; `--server` overrides discovery.
 
 `--help` lists all knobs. Missing server executable: exit 0 with an explicit
 `skipped` status, never a zero-throughput success. A server that starts and
@@ -70,14 +77,18 @@ versions or payloads. The ledger compares the complete payload against the
 issued append and ties that identity to its acknowledged version. Every
 subscriber must agree with that same per-log mapping, including when records
 arrive before Acks. Gaps, changed payloads, duplicate Acks, insufficient
-synced watermarks and missing final deliveries are errors. Ledger memory is
+synced watermarks and missing final deliveries are errors. Subscribe must acknowledge before
+records; every Credit must acknowledge exactly once. Missing or duplicate
+control acknowledgements fail too. Ledger memory is
 linear in issued appends, not in subscribers times delivered records.
 
 Each run first puts a zero-credit subscriber, an active subscriber and an
 appender on the same unix connection. The active side must acknowledge and
 deliver 128 x 32 KiB patches within the deadline while the stopped stream
 receives nothing. That stream must then replay exactly one record after a
-one-record grant. A stall or credit overrun is a hard failure. HTTP runs use
+one-record grant, followed by a checked 250 ms silence interval. Duplicate
+subscription acknowledgements are rejected. A stall or credit overrun is a
+hard failure. HTTP runs use
 the same call connection and session-routed SSE endpoints, since HTTP streams
 necessarily occupy separate sockets. This is not a test of a peer that stops
 reading TCP altogether; it tests the protocol's credit isolation claim.
@@ -102,7 +113,8 @@ in headline rates. Checks retain only the current epoch's ledger.
 
 `cargo test -p lug-load` tests the checker and timing code, drives a real unix
 socket against an in-process mock with injected faults, and exercises raw
-HTTP chunk/SSE parsing. These tests establish harness behavior, not daemon
+HTTP chunk/SSE parsing and session-routed credit/cancel/replay. CLI tests
+check missing-server skips and startup failures. These tests establish harness behavior, not daemon
 performance or durable storage. Run the executable against the real daemon
 for conformance and headline measurements. No real-server numbers are claimed
 by the unit tests or by a missing-binary skip.

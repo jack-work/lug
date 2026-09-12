@@ -38,7 +38,7 @@ async fn main() -> ExitCode {
     };
     match execute(&cfg).await {
         Ok(Some(report)) => {
-            report_output(&report, cfg.json);
+            report_output(&report, cfg.json, cfg.smoke);
             ExitCode::SUCCESS
         }
         Ok(None) => ExitCode::SUCCESS,
@@ -193,6 +193,7 @@ async fn benchmark(
     }
     Ok(json!({
         "schema": 1, "status": "passed",
+        "mode": if cfg.smoke { "smoke" } else if cfg.soak { "soak" } else { "load" },
         "transport": if cfg.transport == Transport::Unix { "unix" } else { "http" },
         "single_unix_listener": true,
         "rlimit_nofile": {"before": limits.before, "soft": limits.soft, "hard": limits.hard},
@@ -209,9 +210,23 @@ async fn benchmark(
     }))
 }
 
-fn report_output(report: &Value, as_json: bool) {
+fn report_output(report: &Value, as_json: bool, smoke: bool) {
     if as_json {
         println!("{report}");
+        return;
+    }
+    if smoke {
+        let measured = &report["epochs"][0]["measurement"];
+        println!("PASS smoke: one log, one appender, one subscriber");
+        println!(
+            "{} appends acknowledged, {} exact subscriber deliveries",
+            measured["acknowledged_appends"], measured["subscriber_records"]
+        );
+        println!("Credit isolation and durable SIGKILL/restart replay passed");
+        println!(
+            "Append latency: p50={} us, p99={} us",
+            measured["append_latency"]["p50_us"], measured["append_latency"]["p99_us"]
+        );
         return;
     }
     println!("{:<48} value", "metric");

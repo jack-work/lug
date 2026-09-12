@@ -6,7 +6,7 @@ pub const HELP: &str = "lug-load: raw-socket load and conformance tests for lug-
 
 Usage: lug-load [OPTIONS]
 
-  --server PATH          Server executable [lug-server, searched in PATH]
+  --server PATH          Server executable [sibling lug-server, then PATH]
   --connections N        Held transport connections [10000]
   --logs N               Independent Noop logs [1]
   --appenders-per-log N   Writer lanes per log [1]
@@ -20,6 +20,7 @@ Usage: lug-load [OPTIONS]
   --parallel N           Parallel connection setup/accept workers [128]
   --max-inflight N       Hard limit on outstanding appends [65536]
   --timeout SECONDS      Startup, probe and drain deadline [30]
+  --smoke               One-connection end-to-end check, a few seconds
   --soak                Repeat measured epochs with crash/replay and fd checks
   --soak-cycles N        Number of epochs in soak mode [10]
   --fd-slack N           Allowed post-churn fd growth [0]
@@ -58,6 +59,7 @@ pub struct Config {
     pub parallel: usize,
     pub max_inflight: usize,
     pub timeout: Duration,
+    pub smoke: bool,
     pub soak: bool,
     pub soak_cycles: usize,
     pub fd_slack: usize,
@@ -67,7 +69,11 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            server: PathBuf::from("lug-server"),
+            server: std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|dir| dir.join("lug-server")))
+                .filter(|path| path.is_file())
+                .unwrap_or_else(|| PathBuf::from("lug-server")),
             connections: 10_000,
             logs: 1,
             appenders: 1,
@@ -81,6 +87,7 @@ impl Default for Config {
             parallel: 128,
             max_inflight: 65536,
             timeout: Duration::from_secs(30),
+            smoke: false,
             soak: false,
             soak_cycles: 10,
             fd_slack: 0,
@@ -91,10 +98,24 @@ impl Default for Config {
 
 impl Config {
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self> {
-        let mut cfg = Self::default();
+        let args: Vec<_> = args.into_iter().collect();
+        let mut cfg = if args.iter().any(|arg| arg == "--smoke") {
+            Self {
+                smoke: true,
+                connections: 1,
+                rate: 20,
+                duration: Duration::from_secs(1),
+                accepts: 4,
+                parallel: 1,
+                ..Self::default()
+            }
+        } else {
+            Self::default()
+        };
         let mut args = args.into_iter();
         while let Some(flag) = args.next() {
             match flag.as_str() {
+                "--smoke" => cfg.smoke = true,
                 "--soak" => cfg.soak = true,
                 "--json" => cfg.json = true,
                 "--" => {
@@ -135,6 +156,11 @@ impl Config {
                                 )));
                             }
                             let duration = Duration::from_secs_f64(n);
+                            if duration.is_zero() {
+                                return Err(error(format!(
+                                    "{flag} is below clock resolution: {value}"
+                                )));
+                            }
                             if flag == "--duration" {
                                 cfg.duration = duration;
                             } else {
@@ -161,6 +187,16 @@ impl Config {
                 }
             }
         }
+        if cfg.smoke
+            && (cfg.connections != 1 || cfg.logs != 1 || cfg.appenders != 1 || cfg.subscribers != 1)
+        {
+            return Err(error(
+                "--smoke requires one connection, log, appender and subscriber; omit it for a load run",
+            ));
+        }
+        if cfg.smoke && cfg.soak {
+            return Err(error("--smoke and --soak are separate modes"));
+        }
         for (name, value) in [
             ("connections", cfg.connections),
             ("logs", cfg.logs),
@@ -185,6 +221,9 @@ impl Config {
             .checked_mul(cfg.appenders)
             .and_then(|_| cfg.logs.checked_mul(cfg.subscribers))
             .ok_or_else(|| error("log/worker count overflow"))?;
+        if cfg.planned()? > u64::MAX - (1 << 32) - 16 {
+            return Err(error("workload exhausts protocol request ids"));
+        }
         if cfg.planned()? == 0 {
             return Err(error(
                 "rate times duration must schedule at least one append",
@@ -220,6 +259,15 @@ mod tests {
         ] {
             assert!(parse(args).is_err(), "{args}");
         }
+    }
+
+    #[test]
+    fn smoke_is_small_and_distinct_from_soak() {
+        let cfg = parse("--smoke").unwrap();
+        assert_eq!(cfg.connections, 1);
+        assert_eq!(cfg.logs * cfg.appenders * cfg.subscribers, 1);
+        assert_eq!(cfg.planned().unwrap(), 20);
+        assert!(parse("--smoke --soak").is_err());
     }
 
     #[test]
