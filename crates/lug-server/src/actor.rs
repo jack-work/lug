@@ -306,9 +306,10 @@ where
             })?,
             None => self.log.view(),
         };
-        let value =
-            serde_json::to_value(&view.view).map_err(|e| Failure::new(Code::Internal, e))?;
-        Ok((view.view.version(), value))
+        // The frame carries the version in its own field, so serializing the
+        // pointer whole would put it on the wire twice and make every client
+        // reach past a wrapper for the state it wants.
+        Ok((view.view.version(), view.view.state()))
     }
 
     fn catch_up(&self, after: Version, limit: usize) -> Result<CatchUp, Failure> {

@@ -17,6 +17,10 @@ impl Versioned for Mark {
     fn version(&self) -> Version {
         self.0
     }
+
+    fn state(&self) -> serde_json::Value {
+        serde_json::Value::Null
+    }
 }
 
 type Store = SegmentStore<Mark>;

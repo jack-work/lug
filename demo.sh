@@ -94,6 +94,13 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# A killed daemon leaves its socket file behind, so the file existing proves
+# nothing. Connect to it instead.
+socket_live() {
+	[ -S "$SOCK" ] || return 1
+	"$LUG" --socket "$SOCK" ls >/dev/null 2>&1
+}
+
 mkdir -p "$DIR/data" "$DIR/run"
 # The token is a demo secret and lives only in the scratch dir, which mktemp
 # already made 0700.
@@ -117,16 +124,19 @@ say "starting the daemon"
 "$SERVER" --config "$DIR/lug.toml" >"$DIR/server.log" 2>&1 &
 SERVER_PID=$!
 
-# Wait on the socket rather than sleeping, and give up rather than hang.
-for _ in $(seq 1 100); do
-	[ -S "$SOCK" ] && break
-	kill -0 "$SERVER_PID" 2>/dev/null || {
-		cat "$DIR/server.log" >&2
-		die "daemon exited during startup"
-	}
-	sleep 0.05
-done
-[ -S "$SOCK" ] || { cat "$DIR/server.log" >&2; die "socket never appeared at $SOCK"; }
+await_daemon() {
+	for _ in $(seq 1 200); do
+		socket_live && return 0
+		kill -0 "$SERVER_PID" 2>/dev/null || {
+			cat "$DIR/server.log" >&2
+			die "daemon exited during startup"
+		}
+		sleep 0.05
+	done
+	cat "$DIR/server.log" >&2
+	die "daemon never answered on $SOCK"
+}
+await_daemon
 printf '   daemon up, pid %s\n' "$SERVER_PID"
 
 if [ "$TRANSPORT" = http ]; then
@@ -184,11 +194,7 @@ printf '   SIGKILL sent, no clean shutdown, no checkpoint\n'
 
 "$SERVER" --config "$DIR/lug.toml" >>"$DIR/server.log" 2>&1 &
 SERVER_PID=$!
-for _ in $(seq 1 100); do
-	[ -S "$SOCK" ] && break
-	sleep 0.05
-done
-[ -S "$SOCK" ] || { cat "$DIR/server.log" >&2; die "daemon did not come back"; }
+await_daemon
 
 say "recovered from the write-ahead log"
 run "$LUG" "${AT[@]}" ls

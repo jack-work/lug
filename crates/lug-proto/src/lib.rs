@@ -151,6 +151,12 @@ pub enum Response {
     Records { id: Id, records: Vec<Record> },
     /// A materialized view: the reply to [`Request::Read`], or the preamble of
     /// a [`Mode::Reducible`] subscription.
+    ///
+    /// `value` is the bare document, not a serialized MVCC pointer wrapping
+    /// it. The version lives in this frame's own field; carrying it inside
+    /// `value` as well would only give a client two places to disagree with
+    /// itself, and would make every reader unwrap a field whose name depends
+    /// on which data structure the log happens to use.
     View { id: Id, version: Version, value: Value },
     /// The subscriber fell behind retention. Versions in `(from, to]` are gone
     /// and the stream resumes at `to`.

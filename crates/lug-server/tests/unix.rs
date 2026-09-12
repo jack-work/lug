@@ -365,13 +365,14 @@ async fn a_reducible_log_materializes_a_view() {
     assert_eq!(versions(&ack), vec![1, 2]);
 
     match client.call(Request::Read { id: 3, log: "store".into(), at: None }).await {
-        // The value is the view exactly as it would be checkpointed, so a
-        // follower can adopt it without a second encoding.
+        // The value is the bare document. The version lives in the frame,
+        // and putting it on the wire twice would only give a client two
+        // places to disagree with itself.
         Response::View { version, value, .. } => {
             assert_eq!(version, 2);
-            assert_eq!(value["version"], json!(2));
-            assert_eq!(value["root"]["a"], json!(1));
-            assert_eq!(value["root"]["b"], json!(2));
+            assert!(value.get("version").is_none());
+            assert_eq!(value["a"], json!(1));
+            assert_eq!(value["b"], json!(2));
         }
         other => panic!("expected View, got {other:?}"),
     }

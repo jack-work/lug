@@ -11,6 +11,10 @@ impl Versioned for Snapshot {
     fn version(&self) -> Version {
         self.version()
     }
+
+    fn state(&self) -> serde_json::Value {
+        self.root().to_json()
+    }
 }
 
 impl Reducible for Store {

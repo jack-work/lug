@@ -6,6 +6,16 @@ use serde::{Serialize, de::DeserializeOwned};
 /// and shipped to followers.
 pub trait Versioned: Clone + Send + Sync + Serialize + DeserializeOwned + 'static {
     fn version(&self) -> Version;
+
+    /// The materialized state this pointer names, without the version framing
+    /// the pointer carries around it.
+    ///
+    /// Serializing the pointer whole would put the version on the wire twice,
+    /// since `Response::View` already has a field for it, and would force
+    /// every client to reach past a redundant wrapper to find the state it
+    /// actually wants. A generic server cannot know which field to unwrap, so
+    /// the structure says.
+    fn state(&self) -> serde_json::Value;
 }
 
 /// A data structure that folds patches into versions.
@@ -92,6 +102,11 @@ pub struct Tick(pub Version);
 impl Versioned for Tick {
     fn version(&self) -> Version {
         self.0
+    }
+
+    /// A counter materializes nothing.
+    fn state(&self) -> serde_json::Value {
+        serde_json::Value::Null
     }
 }
 

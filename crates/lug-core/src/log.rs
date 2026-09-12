@@ -48,6 +48,10 @@ impl<V: Versioned> Versioned for LogView<V> {
     fn version(&self) -> Version {
         self.view.version()
     }
+
+    fn state(&self) -> serde_json::Value {
+        self.view.state()
+    }
 }
 
 type LogError<D, S> = Error<<D as Reducible>::Error, <S as Storage>::Error>;

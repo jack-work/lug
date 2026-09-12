@@ -124,8 +124,8 @@ async fn sigkill_then_restart_recovers_every_acknowledged_append() {
     match client.call(Request::Read { id: 2, log: "notes".into(), at: None }).await {
         Response::View { version, value, .. } => {
             assert_eq!(version, 3);
-            assert_eq!(value["root"]["title"], json!("lug: a little log"));
-            assert_eq!(value["root"]["author"]["name"], json!("Gluck"));
+            assert_eq!(value["title"], json!("lug: a little log"));
+            assert_eq!(value["author"]["name"], json!("Gluck"));
         }
         other => panic!("expected View, got {other:?}"),
     }
@@ -235,8 +235,8 @@ async fn checkpoints_taken_along_the_way_recover_to_the_same_state() {
     match client.call(Request::Read { id: 1, log: "counted".into(), at: None }).await {
         Response::View { version, value, .. } => {
             assert_eq!(version, 23);
-            assert_eq!(value["root"]["k0"], json!(0));
-            assert_eq!(value["root"]["k22"], json!(22));
+            assert_eq!(value["k0"], json!(0));
+            assert_eq!(value["k22"], json!(22));
         }
         other => panic!("expected View, got {other:?}"),
     }
