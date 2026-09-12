@@ -15,5 +15,11 @@ serde_json.workspace = true
 thiserror.workspace = true
 rustix = { version = "1", features = ["fs"] }
 
+[features]
+# Lets a test make a write fail partway through a batch, to prove the error
+# path leaves nothing recoverable. Never on in a real build.
+fault-injection = []
+
 [dev-dependencies]
+lug-wal = { path = ".", features = ["fault-injection"] }
 tempfile = "3"

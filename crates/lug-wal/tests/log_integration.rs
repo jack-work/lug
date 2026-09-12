@@ -1,13 +1,11 @@
 //! The store under the thing that will actually use it.
 
-use lug_core::{Durability, Log, Noop, Reducible};
+use lug_core::{Durability, Log, Noop, Tick};
 use lug_wal::{Options, SegmentStore};
 use serde_json::json;
 use std::path::Path;
 
-/// `Noop`'s view type is not re-exported from lug-core, so it can only be
-/// named through the trait.
-type Store = SegmentStore<<Noop as Reducible>::View>;
+type Store = SegmentStore<Tick>;
 
 fn open(dir: &Path) -> Log<Noop, Store> {
     let store = SegmentStore::open_with(dir, Options { rotate_bytes: 4096 }).expect("open store");

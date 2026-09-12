@@ -6,11 +6,34 @@
 //! that already has its blocks and its size. Recovery scans forward from the
 //! header, stops at the torn tail a crash leaves behind, and truncates there.
 //!
+//! The invariant everything else hangs off: **nothing above the logical end of
+//! a segment may be recoverable as a record.** Preallocation gives it for free,
+//! since a zero record length reads as the end. A failed append restores it by
+//! zeroing what it wrote, because the next batch may be shorter and would
+//! otherwise leave the old tail exposed as a valid record at the next version.
+//! If that zeroing itself fails the store is poisoned: further appends are
+//! refused with [`Error::Poisoned`] until it is reopened or reloaded, which
+//! rescans and settles where the records really end.
+//!
+//! Two behaviours that tend to surprise:
+//!
+//! - A batch is never split across segments, so rotation happens *before* a
+//!   batch and a segment can overshoot [`DEFAULT_ROTATE_BYTES`] by one batch.
+//!   One enormous append therefore produces one enormous segment, and since
+//!   the segment being written is never reclaimed, a checkpoint over it frees
+//!   nothing.
+//! - [`oldest`](Storage::oldest) on a log with no segments reports
+//!   `header version + 1`, the version that will be written next. Nothing is
+//!   readable, and nothing below that will ever be.
+//!
 //! [`fdatasync`]: sys::fdatasync
 
 mod format;
 mod segment;
 mod sys;
+
+#[cfg(feature = "fault-injection")]
+pub use sys::fault;
 
 use bytes::Bytes;
 use format::{
@@ -80,6 +103,23 @@ pub enum Error {
     Oversized { version: Version, len: usize, max: u32 },
     #[error("version {requested} was reclaimed; oldest readable is {oldest}")]
     Reclaimed { requested: Version, oldest: Version },
+    #[error(
+        "version {version} carries an empty payload, which reads back as the end of the segment"
+    )]
+    Empty { version: Version },
+    #[error(
+        "{path}: an append failed at offset {offset} and the bytes above it could not be zeroed: {source}"
+    )]
+    CleanupFailed {
+        path: PathBuf,
+        offset: u64,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "{path} is poisoned: bytes above offset {offset} may replay as records nobody was told about, so appending is refused until the store is reopened"
+    )]
+    Poisoned { path: PathBuf, offset: u64 },
 }
 
 impl Error {
@@ -87,6 +127,13 @@ impl Error {
         let path = path.as_ref().to_path_buf();
         move |source| Error::Io { path, source }
     }
+}
+
+/// Where an append failed to clean up after itself.
+#[derive(Clone, Debug)]
+struct Poison {
+    path: PathBuf,
+    offset: u64,
 }
 
 /// The checkpoint, as it appears inside the header file.
@@ -114,6 +161,10 @@ pub struct SegmentStore<V: Versioned> {
     /// Whether the torn tail has been found. Appending before that would
     /// write over a record, or into the middle of one.
     recovered: bool,
+    /// Set when a failed append could not erase what it had written. Every
+    /// later append is refused, because a shorter one would leave those bytes
+    /// readable above it.
+    poison: Option<Poison>,
     view: PhantomData<fn() -> V>,
 }
 
@@ -135,6 +186,7 @@ impl<V: Versioned> SegmentStore<V> {
             header_version: 0,
             rotate_bytes: options.rotate_bytes.max((SEG_PROLOGUE + REC_PREFIX) as u64),
             recovered: false,
+            poison: None,
             view: PhantomData,
         };
         store.list_segments()?;
@@ -255,6 +307,9 @@ impl<V: Versioned> SegmentStore<V> {
             });
         }
         self.recovered = true;
+        // The scan just established where the records really end, so whatever
+        // an earlier failure left behind is either adopted or unreachable.
+        self.poison = None;
         Ok(tail)
     }
 
@@ -338,12 +393,18 @@ impl<V: Versioned> Storage for SegmentStore<V> {
         if records.is_empty() {
             return Ok(());
         }
+        if let Some(poison) = &self.poison {
+            return Err(Error::Poisoned { path: poison.path.clone(), offset: poison.offset });
+        }
         self.ensure_recovered()?;
 
         let mut expected = self.next_version();
         for record in records {
             if record.version != expected {
                 return Err(Error::OutOfOrder { expected, found: record.version });
+            }
+            if record.patch.is_empty() {
+                return Err(Error::Empty { version: record.version });
             }
             if record.patch.len() as u64 > u64::from(format::MAX_PAYLOAD) {
                 return Err(Error::Oversized {
@@ -382,7 +443,24 @@ impl<V: Versioned> Storage for SegmentStore<V> {
             sys::preallocate(file, want).map_err(Error::at(&segment.path))?;
             self.capacity = want;
         }
-        sys::pwritev_all(file, &mut bufs, segment.end).map_err(Error::at(&segment.path))?;
+        if let Err(source) = sys::pwritev_all(file, &mut bufs, segment.end) {
+            // Whatever landed sits above the logical end, where the next,
+            // possibly shorter, batch will not reach it. Left there it is a
+            // well formed record at the next contiguous version: no checksum
+            // and no gap check would catch it, and recovery would replay a
+            // patch the caller was told had failed. Zeroing it puts the file
+            // back to what preallocation promised.
+            let (offset, len) = (segment.end, total);
+            let path = segment.path.clone();
+            let cleaned = sys::zero_range(file, offset, len).and_then(|()| sys::fdatasync(file));
+            return match cleaned {
+                Ok(()) => Err(Error::Io { path, source }),
+                Err(source) => {
+                    self.poison = Some(Poison { path: path.clone(), offset });
+                    Err(Error::CleanupFailed { path, offset, source })
+                }
+            };
+        }
         segment.end += total;
         segment.last = records.last().expect("non-empty").version;
         Ok(())

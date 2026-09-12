@@ -60,6 +60,12 @@ where
             _ => return Ok(Scan { end, torn: true }),
         }
         let (len, crc, version) = split_prefix(&prefix);
+        // Zero is the end marker, which is what preallocation leaves and what
+        // a failed append writes back over itself. Records carry at least one
+        // byte so the two can never be confused.
+        if len == 0 {
+            return Ok(Scan { end, torn: false });
+        }
         let room = file_len.saturating_sub(end + REC_PREFIX as u64);
         if len > MAX_PAYLOAD || u64::from(len) > room {
             return Ok(Scan { end, torn: true });

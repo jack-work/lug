@@ -18,6 +18,7 @@ const IOV_MAX: usize = 1024;
 /// partial write. One call per 1024 buffers, never one per record.
 pub fn pwritev_all(file: &File, mut bufs: &mut [IoSlice<'_>], mut offset: u64) -> io::Result<()> {
     while !bufs.is_empty() {
+        fault::check()?;
         let chunk = &bufs[..bufs.len().min(IOV_MAX)];
         let written = match pwritev(file, chunk, offset) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
@@ -46,6 +47,20 @@ pub fn preallocate(file: &File, len: u64) -> io::Result<()> {
     }
 }
 
+/// Overwrite a range with zeros. A zero record length is the end marker, so
+/// this is what makes bytes above the logical end unrecoverable again.
+pub fn zero_range(file: &File, offset: u64, len: u64) -> io::Result<()> {
+    const CHUNK: u64 = 64 * 1024;
+    let zeros = vec![0u8; CHUNK.min(len) as usize];
+    let mut done = 0;
+    while done < len {
+        let span = (len - done).min(CHUNK) as usize;
+        pwritev_all(file, &mut [IoSlice::new(&zeros[..span])], offset + done)?;
+        done += span as u64;
+    }
+    Ok(())
+}
+
 /// Flush data only. Safe on a preallocated file, where nothing but data moves.
 pub fn fdatasync(file: &File) -> io::Result<()> {
     retry(|| rustix::fs::fdatasync(file))
@@ -70,5 +85,50 @@ fn retry(mut f: impl FnMut() -> Result<(), Errno>) -> io::Result<()> {
             Err(Errno::INTR) => continue,
             Err(e) => return Err(e.into()),
         }
+    }
+}
+
+/// Making a write fail exactly where it hurts, for tests that have to prove
+/// the error path leaves nothing recoverable behind. Compiled out of any build
+/// that does not ask for it.
+#[cfg(feature = "fault-injection")]
+pub mod fault {
+    use std::cell::Cell;
+    use std::io;
+
+    thread_local! {
+        static PLAN: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    /// Let `pass` vectored writes through on this thread, fail the next
+    /// `fail`, then get out of the way.
+    pub fn fail_writes(pass: usize, fail: usize) {
+        PLAN.set((pass, fail));
+    }
+
+    pub fn clear() {
+        PLAN.set((0, 0));
+    }
+
+    pub(super) fn check() -> io::Result<()> {
+        match PLAN.get() {
+            (0, 0) => Ok(()),
+            (0, fail) => {
+                PLAN.set((0, fail - 1));
+                Err(io::Error::other("injected write failure"))
+            }
+            (pass, fail) => {
+                PLAN.set((pass - 1, fail));
+                Ok(())
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "fault-injection"))]
+mod fault {
+    #[inline]
+    pub(super) fn check() -> std::io::Result<()> {
+        Ok(())
     }
 }

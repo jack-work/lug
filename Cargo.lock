@@ -353,6 +353,7 @@ dependencies = [
  "bytes",
  "crc32fast",
  "lug-core",
+ "lug-wal",
  "rustix",
  "serde",
  "serde_json",

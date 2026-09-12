@@ -67,6 +67,67 @@ fn poke(path: &Path, offset: u64, bytes: &[u8]) {
     file.write_all(bytes).expect("write");
 }
 
+/// The one that matters. A batch that fails partway has already put complete,
+/// correctly checksummed records on disk. If they are left above the logical
+/// end, the shorter batch that the caller retries with does not cover them,
+/// and recovery reads the leftovers as records at the next contiguous version:
+/// no checksum complaint, no gap, just a patch nobody was ever told about.
+#[test]
+fn a_failed_append_leaves_no_ghost_above_what_followed_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut wal = store(dir.path(), 1 << 16);
+    wal.append(&records(1..=3)).expect("append");
+
+    // Two chunks of the batch land, 512 records each, then the third fails.
+    lug_wal::fault::fail_writes(2, 1);
+    let err = wal.append(&records(4..=3000)).expect_err("the injected failure must surface");
+    lug_wal::fault::clear();
+    assert!(matches!(err, Error::Io { .. }), "{err}");
+
+    // The caller retries from the version it was left at, with less than it
+    // tried to write the first time. Same patches, so the retry ends exactly
+    // on one of the failed batch's record boundaries and the next leftover is
+    // a whole, valid record at version 6.
+    wal.append(&records(4..=5)).expect("retry");
+    wal.sync().expect("sync");
+    drop(wal);
+
+    let mut wal = store(dir.path(), 1 << 16);
+    let recovered = wal.load().expect("load");
+    assert_eq!(
+        versions(&recovered.tail),
+        vec![1, 2, 3, 4, 5],
+        "a record that was never acknowledged came back from the dead"
+    );
+    assert_eq!(recovered.tail[4].patch, payload(5));
+
+    // And the log carries on from there rather than from the ghost.
+    wal.append(&records(6..=7)).expect("append after the ghost");
+    assert_eq!(versions(&wal.read_after(5, 9).expect("read")), vec![6, 7]);
+}
+
+#[test]
+fn a_store_that_cannot_clean_up_refuses_to_append_again() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut wal = store(dir.path(), 1 << 16);
+    wal.append(&records(1..=3)).expect("append");
+
+    // The batch write fails and so does the zeroing that would erase it.
+    lug_wal::fault::fail_writes(2, 2);
+    let err = wal.append(&records(4..=3000)).expect_err("the injected failure must surface");
+    assert!(matches!(err, Error::CleanupFailed { .. }), "{err}");
+
+    let err = wal.append(&records(4..=5)).expect_err("a poisoned store must not append");
+    assert!(matches!(err, Error::Poisoned { .. }), "{err}");
+
+    // Reloading rescans, so the records that did land are adopted and the
+    // store knows where it stands again.
+    let tail = wal.load().expect("load").tail;
+    let last = tail.last().expect("something landed").version;
+    assert_eq!(versions(&tail), (1..=last).collect::<Vec<_>>());
+    wal.append(&records(last + 1..=last + 2)).expect("append after reload");
+}
+
 #[test]
 fn reopen_replays_every_record() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -243,6 +304,16 @@ fn a_checkpoint_reclaims_the_segments_below_it() {
     assert_eq!(recovered.header, Some(Mark(40)));
     assert_eq!(versions(&recovered.tail), (41..=60).collect::<Vec<_>>());
     assert_eq!(wal.oldest(), oldest);
+}
+
+#[test]
+fn an_empty_payload_is_refused_because_it_reads_as_the_end() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut wal = store(dir.path(), 1 << 16);
+    let empty = Record { version: 1, patch: Bytes::new() };
+
+    let err = wal.append(&[empty]).expect_err("a zero length record must be refused");
+    assert!(matches!(err, Error::Empty { version: 1 }), "{err}");
 }
 
 #[test]
