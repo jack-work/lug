@@ -801,6 +801,7 @@ dependencies = [
  "bytes",
  "cavlc",
  "futures",
+ "getrandom",
  "libc",
  "lug-core",
  "lug-proto",

@@ -186,6 +186,78 @@ async fn a_stream_is_steered_by_calls_naming_its_session() {
     lug.stop().await;
 }
 
+/// The session name is a capability: it is the whole of what stops one caller
+/// from steering another's subscription. Anything a caller can derive from
+/// names it has already been handed must not name a live stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_guessed_session_cannot_steer_another_clients_stream() {
+    let (lug, http) = harness().await;
+    http.call(&Request::Create { id: 1, log: "private".into(), reducible: false }).await;
+    http.call(&Request::Append {
+        id: 2,
+        log: "private".into(),
+        patches: vec![json!({ "n": 1 })],
+        durability: lug_proto::Durability::Durable,
+    })
+    .await;
+
+    // Three streams of our own, to read off whatever pattern the names follow.
+    let mut observed = Vec::new();
+    let mut probes = Vec::new();
+    for id in 10..13 {
+        let mut probe = http.stream(&format!("id={id}&log=private&credit=0")).await;
+        observed.push(session_of(probe.next().await));
+        probes.push(probe);
+    }
+
+    // The victim opens next, on a connection we do not hold.
+    let mut victim = http.stream("id=20&log=private&credit=1").await;
+    let real = session_of(victim.next().await);
+    assert!(matches!(victim.next().await, Response::Records { id: 20, .. }));
+
+    for guess in successors(&observed) {
+        let (status, _) = http.call_with(&Request::Cancel { id: 20 }, Some(&guess)).await;
+        assert_eq!(status, 400, "session {guess} steered a stream it was never given");
+        assert!(
+            victim.try_next(Duration::from_millis(50)).await.is_none(),
+            "guess {guess} reached the victim's stream"
+        );
+    }
+
+    // The victim's own name still works, so the refusals above were the guess
+    // failing and not the stream having died of something else.
+    let (status, response) = http.call_with(&Request::Cancel { id: 20 }, Some(&real)).await;
+    assert_eq!(status, 200);
+    assert!(matches!(response, Response::End { id: 20 }));
+
+    lug.stop().await;
+}
+
+fn session_of(response: Response) -> String {
+    match response {
+        Response::Welcome { session: Some(session), .. } => session,
+        other => panic!("expected a Welcome carrying a session, got {other:?}"),
+    }
+}
+
+/// Names a counter would hand out next: the trailing digit run of each
+/// observed name, bumped, keeping its width.
+fn successors(observed: &[String]) -> Vec<String> {
+    let mut guesses = Vec::new();
+    for name in observed {
+        let digits = name.len() - name.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+        if digits == 0 {
+            continue;
+        }
+        let (head, tail) = name.split_at(name.len() - digits);
+        let Ok(number) = tail.parse::<u128>() else { continue };
+        for step in 1..=3 {
+            guesses.push(format!("{head}{:0width$}", number + step, width = digits));
+        }
+    }
+    guesses
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_token_is_required_and_subscribe_belongs_on_the_stream() {
     let (lug, http) = harness().await;
