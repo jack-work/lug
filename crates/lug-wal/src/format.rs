@@ -32,6 +32,9 @@ pub fn parse_segment_name(name: &str) -> Option<Version> {
     digits.parse().ok()
 }
 
+/// CRC-32 as `crc32fast` computes it, which is the zlib polynomial with
+/// hardware carryless multiply, not the Castagnoli polynomial the spec calls
+/// crc32c. The format is self consistent either way; only the name is off.
 pub fn checksum(version: Version, payload: &[u8]) -> u32 {
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(&version.to_le_bytes());

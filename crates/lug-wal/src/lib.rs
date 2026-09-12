@@ -14,8 +14,8 @@ mod sys;
 
 use bytes::Bytes;
 use format::{
-    HDR_MAGIC, REC_PREFIX, header_bytes, parse_segment_name, record_prefix, segment_name,
-    segment_prologue,
+    HDR_MAGIC, REC_PREFIX, SEG_PROLOGUE, header_bytes, parse_segment_name, record_prefix,
+    segment_name, segment_prologue,
 };
 use lug_core::{Record, Recovered, Storage, Version, Versioned};
 use segment::Segment;
@@ -133,7 +133,7 @@ impl<V: Versioned> SegmentStore<V> {
             active: None,
             capacity: 0,
             header_version: 0,
-            rotate_bytes: options.rotate_bytes.max(REC_PREFIX as u64),
+            rotate_bytes: options.rotate_bytes.max((SEG_PROLOGUE + REC_PREFIX) as u64),
             recovered: false,
             view: PhantomData,
         };
@@ -281,12 +281,7 @@ impl<V: Versioned> SegmentStore<V> {
         sys::fsync(&file).map_err(Error::at(&path))?;
         self.sync_dir()?;
 
-        self.segments.push(Segment {
-            first,
-            path,
-            end: prologue.len() as u64,
-            last: first - 1,
-        });
+        self.segments.push(Segment { first, path, end: prologue.len() as u64, last: first - 1 });
         self.capacity = self.rotate_bytes;
         self.active = Some(file);
         Ok(())
@@ -429,7 +424,7 @@ impl<V: Versioned> Storage for SegmentStore<V> {
     }
 
     fn read_after(&self, after: Version, limit: usize) -> Result<Vec<Record>, Error> {
-        let start = after + 1;
+        let start = after.saturating_add(1);
         let oldest = self.oldest();
         if start < oldest {
             return Err(Error::Reclaimed { requested: start, oldest });

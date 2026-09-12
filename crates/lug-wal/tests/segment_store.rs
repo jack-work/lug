@@ -109,12 +109,7 @@ fn a_torn_record_is_cut_off_and_everything_before_it_survives() {
     // would have.
     let seg = segment_files(dir.path()).remove(0);
     let end = data_end(1, 40);
-    OpenOptions::new()
-        .write(true)
-        .open(&seg)
-        .expect("open")
-        .set_len(end - 3)
-        .expect("truncate");
+    OpenOptions::new().write(true).open(&seg).expect("open").set_len(end - 3).expect("truncate");
 
     let mut wal = store(dir.path(), 1 << 16);
     let recovered = wal.load().expect("load");
@@ -259,4 +254,41 @@ fn an_empty_log_recovers_to_nothing() {
     assert_eq!(wal.oldest(), 1);
     assert!(wal.read_after(0, 8).expect("read").is_empty());
     wal.sync().expect("sync with no segment open");
+}
+
+#[test]
+fn one_append_carries_more_records_than_a_single_writev_can() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut wal = store(dir.path(), 1 << 16);
+
+    // 3000 records is 6000 buffers, well past the 1024 the kernel takes per
+    // call, and more bytes than the segment was preallocated for.
+    wal.append(&records(1..=3000)).expect("append");
+    wal.sync().expect("sync");
+    assert_eq!(segment_files(dir.path()).len(), 1, "a batch must not be split");
+    drop(wal);
+
+    let mut wal = store(dir.path(), 1 << 16);
+    let recovered = wal.load().expect("load");
+    assert_eq!(versions(&recovered.tail), (1..=3000).collect::<Vec<_>>());
+    assert_eq!(recovered.tail[2999].patch, payload(3000));
+}
+
+#[test]
+fn a_corrupt_header_is_refused_rather_than_ignored() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut wal = store(dir.path(), 1 << 16);
+    wal.append(&records(1..=4)).expect("append");
+    wal.write_header(&Mark(2)).expect("checkpoint");
+    drop(wal);
+
+    // One byte of the json. A header that cannot be trusted must not be
+    // silently replaced by a full replay: the view it names may already be
+    // serving readers.
+    poke(&dir.path().join("header"), 17, b"X");
+
+    let err = SegmentStore::<Mark>::open_with(dir.path(), Options { rotate_bytes: 1 << 16 })
+        .err()
+        .expect("a bad header checksum must fail loudly");
+    assert!(matches!(err, Error::HeaderChecksum { .. }), "{err}");
 }
