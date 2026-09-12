@@ -9,6 +9,10 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 lug-proto.workspace = true
+# crossterm comes from ratatui's re-export so the two can never disagree on a
+# version, which they would silently do through the backend's types.
+ratatui = "0.29"
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true }
+unicode-width = "0.2"
