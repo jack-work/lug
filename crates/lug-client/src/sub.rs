@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use tokio::sync::mpsc;
+use tokio_util::sync::PollSender;
 
 /// What a subscriber observes: records in version order, and the gaps between
 /// them, ending after the server closes the stream.
@@ -94,6 +95,8 @@ pub struct Frames {
     window: u32,
     /// Records handed to the consumer since the last grant went out.
     drained: u32,
+    pending_credit: u32,
+    credit: PollSender<Command>,
     done: bool,
     _charged: Load,
 }
@@ -128,11 +131,13 @@ impl Frames {
         }
         Ok(Self {
             id,
+            credit: PollSender::new(handle.cmd.clone()),
             handle,
             rx,
             overrun,
             window,
             drained: 0,
+            pending_credit: 0,
             done: false,
             _charged: charged,
         })
@@ -149,28 +154,23 @@ impl Frames {
     /// Ask for more room before the consumer has earned it. Rarely needed:
     /// draining grants credit on its own.
     pub fn grant(&mut self, records: u32) {
-        self.send_credit(records);
-    }
-
-    fn send_credit(&mut self, grant: u32) {
-        if grant == 0 {
-            return;
-        }
-        let req = Request::Credit { id: self.id, grant };
-        // A full command queue means the connection is congested; keep the
-        // count and try again on the next drain rather than blocking a poll.
-        if self.handle.cmd.try_send(Command::Fire(req)).is_ok() {
-            self.drained = self.drained.saturating_sub(grant);
+        self.pending_credit = self.pending_credit.saturating_add(records);
+        let req = Request::Credit { id: self.id, grant: self.pending_credit };
+        if self.pending_credit > 0 && self.handle.cmd.try_send(Command::Fire(req)).is_ok() {
+            self.pending_credit = 0;
         }
     }
 
-    /// Replenish once the consumer has taken half a window, which keeps the
-    /// server pushing without a grant per record.
-    fn maybe_grant(&mut self) {
+    fn maybe_grant(&mut self, cx: &mut Context<'_>) {
         let threshold = (self.window / 2).max(1);
         if self.drained >= threshold {
-            let grant = self.drained;
-            self.send_credit(grant);
+            self.pending_credit = self.pending_credit.saturating_add(std::mem::take(&mut self.drained));
+        }
+        // A full queue must register a wakeup: the server may already have
+        // exhausted its credit, leaving no next record to trigger a retry.
+        if self.pending_credit > 0 && matches!(self.credit.poll_reserve(cx), Poll::Ready(Ok(()))) {
+            let grant = std::mem::take(&mut self.pending_credit);
+            let _ = self.credit.send_item(Command::Fire(Request::Credit { id: self.id, grant }));
         }
     }
 }
@@ -184,6 +184,7 @@ impl Stream for Frames {
             if this.done {
                 return Poll::Ready(None);
             }
+            this.maybe_grant(cx);
             match this.rx.poll_recv(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => {
@@ -210,7 +211,7 @@ impl Stream for Frames {
                     }
                     Response::Records { id, records } => {
                         this.drained = this.drained.saturating_add(records.len() as u32);
-                        this.maybe_grant();
+                        this.maybe_grant(cx);
                         return Poll::Ready(Some(Ok(Response::Records { id, records })));
                     }
                     other => return Poll::Ready(Some(Ok(other))),
@@ -229,5 +230,45 @@ impl Drop for Frames {
                 .try_send(Command::Fire(Request::Cancel { id: self.id }));
         }
         let _ = self.handle.cmd.try_send(Command::Forget(self.id));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+    use lug_proto::{Mode, Record};
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn the_last_credit_grant_survives_a_full_command_queue() {
+        let (cmd, mut commands) = mpsc::channel(1);
+        let handle = Handle::new(cmd.clone(), Arc::new(AtomicUsize::new(0)));
+        let mut frames = Frames::open(
+            handle,
+            7,
+            Request::Subscribe { id: 7, log: "log".into(), from: 0, mode: Mode::Records, credit: 1 },
+            1,
+            Duration::from_secs(1),
+        ).await.unwrap();
+        let Some(Command::Stream { sink, .. }) = commands.recv().await else { panic!("subscribe") };
+        cmd.send(Command::Fire(Request::Ping { id: 8 })).await.unwrap_or_else(|_| panic!("fill queue"));
+        sink.send(Ok(Response::Records { id: 7, records: vec![Record { version: 1, patch: serde_json::Value::Null }] })).await.unwrap();
+        assert!(matches!(frames.next().await, Some(Ok(Response::Records { .. }))));
+
+        let next = frames.next();
+        futures::pin_mut!(next);
+        assert!(futures::poll!(&mut next).is_pending());
+        assert!(matches!(commands.recv().await, Some(Command::Fire(Request::Ping { id: 8 }))));
+        // No more records can arrive until this grant goes out. Retrying only
+        // on the next record leaves both sides waiting for each other.
+        let grant = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                frame = &mut next => panic!("stream ended while granting credit: {frame:?}"),
+                command = commands.recv() => command,
+            }
+        }).await.expect("credit was lost when the command queue filled");
+        assert!(matches!(grant, Some(Command::Fire(Request::Credit { id: 7, grant: 1 }))));
     }
 }
