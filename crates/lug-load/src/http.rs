@@ -346,15 +346,16 @@ pub async fn connect(
                     sessions.insert(*id, (session, task));
                     Ok(None)
                 } else {
-                    let session = sessions
-                        .get(&request.id())
-                        .map(|(session, _)| session.as_str());
-                    let response = call.call(&endpoint, session, &request).await?;
-                    if let Request::Cancel { id } = request {
-                        if let Some((_, task)) = sessions.remove(&id) {
+                    let session = if let Request::Cancel { id } = &request {
+                        sessions.remove(id).map(|(session, task)| {
+                            // EOF is expected once Cancel reaches the server; its POST supplies the End acknowledgement.
                             task.abort();
-                        }
-                    }
+                            session
+                        })
+                    } else {
+                        sessions.get(&request.id()).map(|(session, _)| session.clone())
+                    };
+                    let response = call.call(&endpoint, session.as_deref(), &request).await?;
                     Ok(Some(response))
                 }
             }
