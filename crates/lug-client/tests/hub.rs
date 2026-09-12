@@ -3,7 +3,7 @@
 mod support;
 
 use futures::StreamExt;
-use lug_client::{Error, Hub, Response, Retry, Subscribe, Transport};
+use lug_client::{Error, Event, Hub, Retry, Subscribe, Transport};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -240,9 +240,9 @@ async fn credit_follows_the_consumer() {
 
     let mut taken = 0;
     while taken < 20 {
-        let frame = stream.next().await.expect("frame").expect("no error");
-        if let Response::Records { records, .. } = frame {
-            taken += records.len();
+        let event = stream.next().await.expect("event").expect("no error");
+        if matches!(event, Event::Record(_)) {
+            taken += 1;
         }
     }
     assert!(
@@ -271,8 +271,8 @@ async fn a_subscription_ends_when_the_server_says_so() {
         .subscribe("log", Subscribe::records().credit(8))
         .await
         .expect("subscribe");
-    let first = stream.next().await.expect("frame").expect("no error");
-    assert!(matches!(first, Response::Records { .. }));
+    let first = stream.next().await.expect("event").expect("no error");
+    assert!(matches!(first, Event::Record(_)));
 
     let id = stream.id();
     mock.sim.end_stream(id);

@@ -11,7 +11,7 @@
 //! // A live mirror of the log, rebuilt here and kept current.
 //! let follower = hub.follow("orders").await?;
 //! if let Some(view) = follower.view() {
-//!     println!("version {}", view.version());
+//!     println!("version {}", view.version);
 //! }
 //! # Ok(())
 //! # }
@@ -29,9 +29,10 @@
 //!   riding it at once rather than leaving callers to time out one by one.
 //! - Retries are opt-in ([`Retry`]), because the hub cannot know whether a
 //!   lost `Append` was applied.
-//! - [`Subscription`] grants credit as the consumer drains it, and withholds
-//!   it when the consumer stalls. That is the client half of the server's
-//!   flow control.
+//! - [`Subscription`] is what a subscriber observes: records in version order
+//!   and the gaps between them. It grants credit as the consumer drains it
+//!   and withholds it when the consumer stalls, which is the client half of
+//!   the server's flow control.
 //! - [`Follower`] is the reason the rest exists: a log, rebuilt in memory and
 //!   kept live across reconnects and gaps.
 
@@ -48,9 +49,9 @@ mod unix;
 
 pub use config::{Backoff, Config, Retry};
 pub use error::{Error, Result};
-pub use follower::{Event, Follower, State, Status};
+pub use follower::{Follower, State, Status};
 pub use hub::{Ack, Builder, Hub, Subscribe, View};
-pub use sub::Subscription;
+pub use sub::{Frames, Subscription};
 pub use transport::Transport;
 
-pub use lug_proto::{Code, Durability, Id, LogInfo, Mode, Record, Response, Version};
+pub use lug_proto::{Code, Durability, Event, Id, LogInfo, Mode, Record, Response, Version};

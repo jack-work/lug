@@ -47,9 +47,16 @@ async fn the_follower_converges_on_the_servers_view() {
 
     let state = follower.wait_for(wanted).await.expect("converge");
     assert_eq!(state.status, Status::Live);
-    let view = state.view.expect("a reducible log has a view");
-    assert_eq!(view.version(), mock.sim.version());
-    assert_eq!(view.root().to_json(), mock.sim.root());
+    assert!(follower.reducible());
+    let snapshot = state.snapshot.expect("a reducible log has a view");
+    assert_eq!(snapshot.version(), mock.sim.version());
+    assert_eq!(snapshot.root().to_json(), mock.sim.root());
+
+    // The JSON view a renderer binds to says the same thing, cached per
+    // version rather than rebuilt per call.
+    let view = follower.view().expect("view");
+    assert_eq!(view.version, mock.sim.version());
+    assert_eq!(view.value, mock.sim.root());
 }
 
 #[tokio::test]
@@ -63,7 +70,7 @@ async fn the_view_preamble_may_be_a_bare_root() {
 
     let mut follower = hub.follow("log").await.expect("follow");
     let state = follower.wait_for(sim.version()).await.expect("converge");
-    assert_eq!(state.view.expect("view").root().to_json(), sim.root());
+    assert_eq!(state.snapshot.expect("view").root().to_json(), sim.root());
 }
 
 #[tokio::test]
@@ -93,7 +100,10 @@ async fn the_follower_survives_a_reconnect() {
         .await
         .expect("converged again");
     assert_eq!(state.status, Status::Live);
-    assert_eq!(state.view.expect("view").root().to_json(), mock.sim.root());
+    assert_eq!(
+        state.snapshot.expect("view").root().to_json(),
+        mock.sim.root()
+    );
     assert!(
         mock.sim.connections_used() >= 2,
         "the follower never reconnected"
@@ -105,8 +115,8 @@ async fn the_follower_recovers_from_a_gap() {
     let mock = Mock::start("gap").await;
     let hub = Hub::connect(mock.transport()).await.expect("connect");
     let mut follower = hub.follow("log").await.expect("follow");
-    let events = follower.events().expect("events, handed out once");
-    assert!(follower.events().is_none(), "events are handed out once");
+    let events = follower.records().expect("events, handed out once");
+    assert!(follower.records().is_none(), "events are handed out once");
 
     mock.sim.append(&sequence()).expect("seed");
     follower
@@ -128,21 +138,28 @@ async fn the_follower_recovers_from_a_gap() {
         .wait_for(mock.sim.version())
         .await
         .expect("recovered");
-    assert_eq!(state.view.expect("view").root().to_json(), mock.sim.root());
+    assert_eq!(
+        state.snapshot.expect("view").root().to_json(),
+        mock.sim.root()
+    );
 
     let mut events = events;
-    let mut saw_gap = false;
-    let mut saw_reset = false;
+    let mut gap = None;
     while let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(50), events.recv()).await
     {
-        match event {
-            Event::Gap { .. } => saw_gap = true,
-            Event::Reset { .. } => saw_reset = true,
-            _ => {}
+        if let Event::Gap { from, to } = event {
+            gap = Some((from, to));
         }
     }
-    assert!(saw_gap, "the gap was hidden from the consumer");
-    assert!(saw_reset, "the rebuild was hidden from the consumer");
+    let (from, to) = gap.expect("the gap was hidden from the consumer");
+    assert!(
+        to > from,
+        "a gap that covers nothing is not a gap: {from}..{to}"
+    );
+    assert!(
+        to >= mock.sim.version() - 1,
+        "the gap must run to where the view resumed"
+    );
 }
 
 #[tokio::test]
@@ -150,7 +167,7 @@ async fn records_reach_the_consumer_in_order() {
     let mock = Mock::start("events").await;
     let hub = Hub::connect(mock.transport()).await.expect("connect");
     let mut follower = hub.follow("log").await.expect("follow");
-    let mut events = follower.events().expect("events");
+    let mut events = follower.records().expect("events");
 
     let patches = sequence();
     // Fold the first patch before taking the stream, so what follows is
@@ -188,11 +205,13 @@ async fn a_plain_log_still_ticks_its_versions() {
         .await
         .expect("caught up");
     assert!(
-        state.view.is_none(),
+        state.snapshot.is_none(),
         "a log that keeps no view must not pretend to have one"
     );
+    assert!(!follower.reducible(), "a plain log is not reducible");
+    assert!(follower.view().is_none());
     assert_eq!(state.version, mock.sim.version());
-    assert_eq!(*follower.versions().borrow(), mock.sim.version());
+    assert_eq!(*follower.changed().borrow(), mock.sim.version());
 }
 
 #[tokio::test]
@@ -202,7 +221,7 @@ async fn following_a_missing_log_stops_with_the_reason() {
     let mut follower = hub.follow("absent").await.expect("follow");
 
     loop {
-        let state = follower.changed().await.expect("state");
+        let state = follower.next_change().await.expect("state");
         if let Status::Failed(e) = state.status {
             assert!(e.to_string().contains("no log absent"), "{e}");
             return;
@@ -227,8 +246,8 @@ async fn clones_see_the_same_stream() {
     let target = mock.sim.version();
     let (a, b) = tokio::join!(one.wait_for(target), two.wait_for(target));
     assert_eq!(
-        a.expect("first").view.expect("view").root().to_json(),
-        b.expect("second").view.expect("view").root().to_json()
+        a.expect("first").snapshot.expect("view").root().to_json(),
+        b.expect("second").snapshot.expect("view").root().to_json()
     );
     assert_eq!(follower.version(), target);
 }

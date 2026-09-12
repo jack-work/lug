@@ -1,10 +1,10 @@
 //! The follower: a server-side log, rebuilt and kept live in this process.
 
 use crate::error::{Error, Result};
-use crate::hub::{Hub, Subscribe};
+use crate::hub::{Hub, Subscribe, View};
 use cavlc::{Snapshot, Store};
 use futures::StreamExt;
-use lug_proto::{Code, Mode, Record, Response, Version};
+use lug_proto::{Code, Event, Mode, Record, Response, Version};
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, watch};
@@ -51,74 +51,65 @@ impl Status {
 /// Everything a renderer needs in one immutable value.
 #[derive(Clone, Debug)]
 pub struct State {
-    /// The materialized view, or `None` on a log that is not reducible, where
-    /// only the record stream means anything.
-    pub view: Option<Snapshot>,
+    /// The materialized view as an MVCC pointer: `None` on a log that keeps
+    /// no view, where only the record stream means anything.
+    pub snapshot: Option<Snapshot>,
     /// Highest version folded in so far.
     pub version: Version,
+    /// Whether this log folds patches into a view at all.
+    pub reducible: bool,
     pub status: Status,
-}
-
-/// Something that happened on the stream, for a caller that wants the records
-/// themselves rather than just the folded view.
-#[derive(Clone, Debug)]
-pub enum Event {
-    /// One record, in version order.
-    Record(Record),
-    /// Versions in `(from, to]` are gone from the server's retention. The
-    /// view is refetched, so it stays correct; the records are not.
-    Gap { from: Version, to: Version },
-    /// The view was rebuilt from scratch at this version, after a gap or a
-    /// reconnect. Anything a consumer derived from earlier records is stale.
-    Reset { version: Version },
-    /// Events were dropped because the consumer was not reading them. The
-    /// view is unaffected; it is maintained independently of this channel.
-    Dropped(u64),
 }
 
 /// A live mirror of a log.
 ///
 /// Subscribes in [`Mode::Reducible`], rebuilds a [`cavlc::Store`] from the
-/// view preamble, and folds every arriving patch into it. [`view`](Self::view)
-/// hands out an immutable MVCC snapshot that is O(1) to clone and safe to
-/// hold across a render; the follower keeps advancing behind it.
+/// view preamble, and folds every arriving patch into it. The view is an MVCC
+/// pointer: O(1) to clone and safe to hold across a render while the follower
+/// keeps advancing behind it.
 ///
 /// It survives the connection dying: it resubscribes from its cursor, takes a
 /// fresh view preamble, and carries on, reporting [`Status::Reconnecting`] in
-/// between. A [`Response::Gap`] is recovered the same way, by refetching the
-/// view rather than pretending the missing versions never existed.
+/// between. A gap is recovered the same way, by refetching the view rather
+/// than folding on top of versions that are gone, and the gap still reaches
+/// [`records`](Self::records) so a viewer can say what it lost.
 ///
 /// Cloning is cheap and every clone sees the same stream, so a UI can hand a
 /// clone to each widget. The background task stops when the last clone drops.
 ///
 /// ```no_run
 /// # async fn example(hub: lug_client::Hub) -> lug_client::Result<()> {
-/// let mut follower = hub.follow("orders").await?;
+/// let follower = hub.follow("orders").await?;
+/// let mut changed = follower.changed();
 /// loop {
 ///     if let Some(view) = follower.view() {
-///         render(&view);
+///         render(view.version, &view.value);
 ///     }
-///     follower.changed().await?;
+///     changed.changed().await.ok();
 /// }
 /// # }
-/// # fn render(_: &cavlc::Snapshot) {}
+/// # fn render(_: u64, _: &serde_json::Value) {}
 /// ```
 #[derive(Clone)]
 pub struct Follower {
     log: Arc<str>,
     state: watch::Receiver<State>,
-    /// Separate from `state` so a consumer that only cares about "something
-    /// advanced" can await a `u64` without cloning a whole state.
+    /// Separate from `state` so a render loop can await a `u64` without
+    /// cloning a whole state to find out nothing it cares about moved.
     versions: watch::Receiver<Version>,
-    events: Arc<Mutex<Option<mpsc::Receiver<Event>>>>,
+    records: Arc<Mutex<Option<mpsc::Receiver<Event>>>>,
+    /// The current view as JSON, built once per version rather than once per
+    /// frame of whoever is drawing it.
+    json: Arc<Mutex<Option<View>>>,
 }
 
 impl Follower {
     pub(crate) async fn start(hub: Hub, log: &str, credit: u32) -> Result<Self> {
         let log: Arc<str> = Arc::from(log);
         let initial = State {
-            view: None,
+            snapshot: None,
             version: 0,
+            reducible: true,
             status: Status::Reconnecting,
         };
         let (state_tx, state) = watch::channel(initial);
@@ -131,7 +122,7 @@ impl Follower {
             state: state_tx,
             versions: version_tx,
             events: events_tx,
-            dropped: 0,
+            dropped: None,
             cursor: 0,
             store: None,
             mode: Mode::Reducible,
@@ -141,7 +132,8 @@ impl Follower {
             log,
             state,
             versions,
-            events: Arc::new(Mutex::new(Some(events_rx))),
+            records: Arc::new(Mutex::new(Some(events_rx))),
+            json: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -149,20 +141,39 @@ impl Follower {
         &self.log
     }
 
-    /// The current view. Cheap: an MVCC pointer clone, no copying and no
-    /// locking, safe to hold while the follower keeps advancing.
-    pub fn view(&self) -> Option<Snapshot> {
-        self.state.borrow().view.clone()
+    /// The current view, or `None` on a log that keeps none.
+    ///
+    /// Cheap enough for a render loop: the JSON is built once per version and
+    /// cached, so repeated calls at the same version copy a value instead of
+    /// walking the tree.
+    pub fn view(&self) -> Option<View> {
+        let snapshot = self.state.borrow().snapshot.clone()?;
+        let mut cached = self.json.lock().ok()?;
+        if cached
+            .as_ref()
+            .is_none_or(|v| v.version != snapshot.version())
+        {
+            *cached = Some(View {
+                version: snapshot.version(),
+                value: snapshot.root().to_json(),
+            });
+        }
+        cached.clone()
     }
 
-    /// The current view as plain JSON. Costs a walk of the tree, so call it
-    /// when the version changes, not once per frame of a render loop.
-    pub fn value(&self) -> Option<Value> {
-        self.state
-            .borrow()
-            .view
-            .as_ref()
-            .map(|v| v.root().to_json())
+    /// The view as an MVCC pointer: O(1), no JSON at all. The cheapest way to
+    /// read the structure, and the one to prefer when the caller speaks
+    /// `cavlc`.
+    pub fn snapshot(&self) -> Option<Snapshot> {
+        self.state.borrow().snapshot.clone()
+    }
+
+    /// Whether this log folds patches into a view.
+    ///
+    /// Separate from [`view`](Self::view) being `None`, which is also true of
+    /// a reducible log that has not received its preamble yet.
+    pub fn reducible(&self) -> bool {
+        self.state.borrow().reducible
     }
 
     pub fn version(&self) -> Version {
@@ -178,11 +189,16 @@ impl Follower {
         self.state.borrow().clone()
     }
 
+    /// A watch that ticks once per version advance, on a reducible log and a
+    /// plain one alike. `*rx.borrow()` is the current version.
+    pub fn changed(&self) -> watch::Receiver<Version> {
+        self.versions.clone()
+    }
+
     /// Wait for the next change: a new version, or a change of status.
     ///
-    /// Returns the state that caused the wake. Fails with [`Error::Closed`]
-    /// once the follower has stopped for good.
-    pub async fn changed(&mut self) -> Result<State> {
+    /// Fails with [`Error::Closed`] once the follower has stopped for good.
+    pub async fn next_change(&mut self) -> Result<State> {
         self.state.changed().await.map_err(|_| Error::Closed)?;
         Ok(self.state.borrow_and_update().clone())
     }
@@ -214,19 +230,14 @@ impl Follower {
         self.state.clone()
     }
 
-    /// A watch that ticks once per version advance, on reducible logs and
-    /// plain ones alike.
-    pub fn versions(&self) -> watch::Receiver<Version> {
-        self.versions.clone()
-    }
-
-    /// The arriving records, in version order, with gaps marked.
+    /// The arriving events, in version order, gaps included.
     ///
     /// Handed out once; later calls return `None`. A consumer that stops
-    /// reading loses events, reported as [`Event::Dropped`], and never slows
-    /// the view down.
-    pub fn events(&self) -> Option<mpsc::Receiver<Event>> {
-        self.events.lock().ok()?.take()
+    /// reading loses events rather than slowing the view down, and what it
+    /// lost arrives as an [`Event::Gap`] once it reads again, because a
+    /// silent jump in versions would be a lie.
+    pub fn records(&mut self) -> Option<mpsc::Receiver<Event>> {
+        self.records.lock().ok()?.take()
     }
 }
 
@@ -248,7 +259,9 @@ struct Task {
     state: watch::Sender<State>,
     versions: watch::Sender<Version>,
     events: mpsc::Sender<Event>,
-    dropped: u64,
+    /// Versions a stalled consumer missed, reported as a gap once it reads
+    /// again rather than as a silent jump.
+    dropped: Option<(Version, Version)>,
     cursor: Version,
     store: Option<Store>,
     mode: Mode,
@@ -295,12 +308,14 @@ impl Task {
             mode: self.mode,
             credit: Some(self.credit),
         };
-        let sub = self.hub.subscribe(&self.log, options).await?;
-        futures::pin_mut!(sub);
+        // Frames, not events: only the view preamble can rebuild the store,
+        // and an event stream has nowhere to put it.
+        let frames = self.hub.subscribe_frames(&self.log, options).await?;
+        futures::pin_mut!(frames);
         loop {
             let frame = tokio::select! {
                 _ = self.state.closed() => return Ok(Step::Closed),
-                frame = sub.next() => frame,
+                frame = frames.next() => frame,
             };
             let Some(frame) = frame else {
                 // The stream ended cleanly; a broken connection arrives as an
@@ -337,8 +352,7 @@ impl Task {
                     }
                 }
                 Ok(Response::Gap { from, to, .. }) => {
-                    self.emit(Event::Gap { from, to }).await;
-                    if !self.recover(to).await? {
+                    if !self.recover(from, to).await? {
                         return Ok(Step::Restart);
                     }
                 }
@@ -369,7 +383,7 @@ impl Task {
             if record.version != self.cursor + 1 {
                 // Versions are contiguous by contract, so a jump means we
                 // missed something and must not fold on top of it.
-                return self.recover(record.version - 1).await;
+                return self.recover(self.cursor, record.version - 1).await;
             }
             if let Some(store) = self.store.as_mut() {
                 let patch: cavlc::Patch =
@@ -396,25 +410,33 @@ impl Task {
         Ok(true)
     }
 
-    /// Refetch the view after a gap, so the structure is correct even though
-    /// the records that produced it are gone. `false` asks for a restart when
-    /// the refetch cannot be trusted.
-    async fn recover(&mut self, floor: Version) -> Result<bool> {
+    /// Recover from a gap by refetching the view.
+    ///
+    /// The patches that would have carried the view from `from` to `to` are
+    /// gone, so folding is not an option and the server's current view is the
+    /// only truthful answer. `false` asks for a restart when the refetch
+    /// cannot be trusted.
+    async fn recover(&mut self, from: Version, to: Version) -> Result<bool> {
         if self.mode == Mode::Records {
-            self.cursor = floor;
+            self.cursor = to;
+            self.emit(Event::Gap { from, to }).await;
             self.publish(Status::Live);
             return Ok(true);
         }
         match self.hub.read(&self.log, None).await {
             Ok(view) => {
-                if view.version < floor {
-                    // The view is older than the gap's floor, which can only
-                    // mean we raced a truncation; start the whole stream over.
+                if view.version < to {
+                    // The view is behind the gap's floor, which can only mean
+                    // we raced a truncation; start the whole stream over.
                     return Ok(false);
                 }
                 self.adopt(view.version, &view.value)?;
-                self.emit(Event::Reset {
-                    version: self.cursor,
+                // The gap the consumer is told about runs to where the view
+                // actually resumed, not to where the server said it would,
+                // because everything in between arrived inside the view.
+                self.emit(Event::Gap {
+                    from,
+                    to: self.cursor,
                 })
                 .await;
                 Ok(true)
@@ -425,24 +447,36 @@ impl Task {
     }
 
     fn publish(&mut self, status: Status) {
-        let view = self.store.as_ref().map(|s| s.snapshot());
+        let snapshot = self.store.as_ref().map(|s| s.snapshot());
         let version = self.cursor;
         let _ = self.versions.send(version);
         let _ = self.state.send(State {
-            view,
+            snapshot,
             version,
+            reducible: self.mode == Mode::Reducible,
             status,
         });
     }
 
     /// Never blocks the fold: the view is maintained independently of whether
-    /// anyone is reading the record stream.
+    /// anyone is reading the event stream. What a stalled consumer missed is
+    /// handed to it as a gap, since a jump in versions it cannot see would be
+    /// a lie about contiguity.
     async fn emit(&mut self, event: Event) {
-        if self.dropped > 0 && self.events.try_send(Event::Dropped(self.dropped)).is_ok() {
-            self.dropped = 0;
+        if let Some((from, to)) = self.dropped {
+            if self.events.try_send(Event::Gap { from, to }).is_ok() {
+                self.dropped = None;
+            } else {
+                self.dropped = Some((from, event.cursor()));
+                return;
+            }
         }
+        let cursor = event.cursor();
         if self.events.try_send(event).is_err() {
-            self.dropped += 1;
+            let from = self
+                .dropped
+                .map_or(cursor.saturating_sub(1), |(from, _)| from);
+            self.dropped = Some((from, cursor));
         }
     }
 }

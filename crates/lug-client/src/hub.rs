@@ -3,7 +3,7 @@ use crate::conn::Command;
 use crate::error::{Error, Result};
 use crate::follower::Follower;
 use crate::pool::Pool;
-use crate::sub::Subscription;
+use crate::sub::{Frames, Subscription};
 use crate::transport::Transport;
 use lug_proto::{Durability, Id, LogInfo, Mode, Request, Response, Version};
 use serde_json::Value;
@@ -256,9 +256,19 @@ impl Hub {
         }
     }
 
-    /// Open a stream. Credit is granted automatically as the returned
-    /// [`Subscription`] is drained, and withheld while it is not.
+    /// Open a stream of what a subscriber observes: records in version order,
+    /// and the gaps between them.
+    ///
+    /// Credit is granted automatically as the returned [`Subscription`] is
+    /// drained, and withheld while it is not.
     pub async fn subscribe(&self, log: &str, options: Subscribe) -> Result<Subscription> {
+        Ok(self.subscribe_frames(log, options).await?.into())
+    }
+
+    /// The same stream as raw frames, including the view preamble of a
+    /// [`Mode::Reducible`] subscription. [`Follower`] is built on this;
+    /// most callers want [`subscribe`](Self::subscribe).
+    pub async fn subscribe_frames(&self, log: &str, options: Subscribe) -> Result<Frames> {
         let credit = options.credit.unwrap_or(self.inner.cfg.credit).max(1);
         let timeout = self.inner.cfg.timeout;
         let handle = self.inner.pool.acquire(timeout).await?;
@@ -270,7 +280,7 @@ impl Hub {
             mode: options.mode,
             credit,
         };
-        Subscription::open(handle, id, req, credit, timeout).await
+        Frames::open(handle, id, req, credit, timeout).await
     }
 
     /// Follow a reducible log: rebuild its view here and keep it live.

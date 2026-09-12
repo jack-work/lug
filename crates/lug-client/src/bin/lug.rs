@@ -6,7 +6,7 @@
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use futures::StreamExt;
-use lug_client::{Durability, Error, Hub, Response, Subscribe, Transport, Version};
+use lug_client::{Durability, Error, Event, Hub, Subscribe, Transport, Version};
 use serde_json::Value;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
@@ -472,38 +472,43 @@ async fn tail(hub: &Hub, log: &str, from: Version, follow: bool, credit: u32) ->
         };
         let Some(frame) = frame else { return Ok(()) };
         match frame.map_err(failed("tail"))? {
-            Response::Records { records, .. } => {
-                for record in &records {
-                    let line = serde_json::to_string(record).unwrap_or_default();
-                    // Flushed per record, or a pipe sees nothing until the
-                    // buffer happens to fill.
-                    match writeln!(stdout, "{line}").and_then(|()| stdout.flush()) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
-                        Err(e) => return Err(Fail::new(format!("cannot write to stdout: {e}"))),
-                    }
-                    if target.is_some_and(|target| record.version >= target) {
-                        return Ok(());
-                    }
+            Event::Record(record) => {
+                let line = serde_json::to_string(&record).unwrap_or_default();
+                // Flushed per record, or a pipe sees nothing until the buffer
+                // happens to fill.
+                match writeln!(stdout, "{line}").and_then(|()| stdout.flush()) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+                    Err(e) => return Err(Fail::new(format!("cannot write to stdout: {e}"))),
+                }
+                if target.is_some_and(|target| record.version >= target) {
+                    return Ok(());
                 }
             }
-            Response::Gap { from, to, .. } => {
+            // A gap is data too: say what is missing rather than letting the
+            // versions jump silently.
+            Event::Gap { from, to } => {
                 eprintln!("lug: gap, versions {from}..{to} were reclaimed by the server");
+                if target.is_some_and(|target| to >= target) {
+                    return Ok(());
+                }
             }
-            _ => {}
         }
     }
 }
 
 async fn follow_view(hub: &Hub, out: &Output, log: &str) -> Result<(), Fail> {
-    let mut follower = hub.follow(log).await.map_err(failed("follow"))?;
+    let follower = hub.follow(log).await.map_err(failed("follow"))?;
+    let mut changed = follower.changed();
     loop {
         if let Some(view) = follower.view() {
-            out.line(out.value(&view.root().to_json()))?;
+            out.line(out.value(&view.value))?;
         }
         tokio::select! {
-            changed = follower.changed() => {
-                changed.map_err(failed("follow"))?;
+            advanced = changed.changed() => {
+                if advanced.is_err() {
+                    return Err(Fail::new("the follower stopped"));
+                }
             }
             _ = interrupted() => return Ok(()),
         }
