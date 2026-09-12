@@ -19,14 +19,19 @@ pub const REC_PREFIX: usize = 16;
 /// honest record approaches it; the wire protocol refuses frames at 16 MiB.
 pub const MAX_PAYLOAD: u32 = 64 << 20;
 
-/// 18 zero-padded digits plus `.seg`, named for the first record inside.
+/// 18 zero-padded digits plus `.seg`, named for the first record inside. A
+/// version past 10^18 needs more digits and gets them; the padding is a
+/// minimum, not a width.
 pub fn segment_name(first: Version) -> String {
     format!("{first:018}.seg")
 }
 
+/// Longest a `u64` can be in decimal, and the longest name that can name one.
+const MAX_DIGITS: usize = 20;
+
 pub fn parse_segment_name(name: &str) -> Option<Version> {
     let digits = name.strip_suffix(".seg")?;
-    if digits.len() != 18 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    if !(18..=MAX_DIGITS).contains(&digits.len()) || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     digits.parse().ok()

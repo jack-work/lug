@@ -469,3 +469,38 @@ fn a_segment_is_sized_before_it_is_written() {
     assert_eq!(meta.len(), 1 << 16, "the segment was not sized up front");
     assert!(meta.blocks() * 512 >= data_end(1, 3), "no blocks were reserved");
 }
+
+/// Segment names are the first version inside them, zero padded to eighteen
+/// digits, and the parser insists on exactly eighteen. A log that rotates at
+/// or above 10^18 therefore writes a segment whose name it cannot read back:
+/// on the next open the file is invisible, its records are gone, and the very
+/// next append opens it again and writes a fresh prologue over them.
+#[test]
+fn a_segment_named_past_eighteen_digits_is_still_found() {
+    const HIGH: Version = 999_999_999_999_999_998;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut wal = store(dir.path(), 32);
+    wal.write_header(&Mark(HIGH - 1)).expect("checkpoint the log up near the end of the counter");
+
+    // Rotation is per append here, so every version lands in a segment of its
+    // own and the third one crosses into nineteen digits.
+    for version in HIGH..=HIGH + 2 {
+        wal.append(&records(version..=version)).expect("append");
+    }
+    wal.sync().expect("sync");
+    assert_eq!(segment_files(dir.path()).len(), 3);
+    drop(wal);
+
+    let mut wal = store(dir.path(), 32);
+    let recovered = wal.load().expect("load");
+    assert_eq!(
+        versions(&recovered.tail),
+        (HIGH..=HIGH + 2).collect::<Vec<_>>(),
+        "an acknowledged record went missing with the segment holding it"
+    );
+    wal.append(&records(HIGH + 3..=HIGH + 3)).expect("append");
+    drop(wal);
+
+    let mut wal = store(dir.path(), 32);
+    assert_eq!(versions(&wal.load().expect("load").tail), (HIGH..=HIGH + 3).collect::<Vec<_>>());
+}
