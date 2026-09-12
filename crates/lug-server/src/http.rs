@@ -20,7 +20,7 @@ use lug_proto::{Code, Id, Mode, Request, Response, VERSION, Version, http};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -33,7 +33,6 @@ pub struct Api {
     pub uid: u32,
     token: Arc<String>,
     sessions: Arc<Mutex<HashMap<String, Arc<Session>>>>,
-    next: Arc<AtomicU64>,
 }
 
 impl Api {
@@ -51,7 +50,6 @@ impl Api {
             uid,
             token: Arc::new(token),
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            next: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -203,7 +201,19 @@ async fn stream(
         ));
     }
 
-    let name = format!("s{}", state.next.fetch_add(1, Ordering::Relaxed));
+    let name = match mint() {
+        Some(name) => name,
+        None => {
+            return Err(frame(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Response::Error {
+                    id: query.id,
+                    code: Code::Internal,
+                    message: "no random source for a session name".into(),
+                },
+            ));
+        }
+    };
     let (out, outbox) = mpsc::channel(state.limits.outbox);
     let session = Session::new(
         state.logs.clone(),
@@ -275,4 +285,18 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// A session name is a bearer capability: whoever holds it can grant credit to
+/// and cancel the stream it names. So it comes from the OS random source, not
+/// from a counter or a clock, both of which any other local caller can guess
+/// from a name it was handed for a stream of its own.
+fn mint() -> Option<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).ok()?;
+    let mut name = String::with_capacity(2 * bytes.len());
+    for byte in bytes {
+        let _ = write!(name, "{byte:02x}");
+    }
+    Some(name)
 }
