@@ -14,6 +14,7 @@ import {
   Follower,
   FrameDecoder,
   LugConnectionError,
+  LugGapError,
   LugTimeoutError,
   encodeFrame,
 } from "../src/index.js";
@@ -128,6 +129,68 @@ test("unix client times out calls and rejects all pending calls on disconnect", 
   }
 });
 
+test("a response tag the union does not know kills the connection", async () => {
+  const fixture = await unixFixture((request, socket) => {
+    // A variant from some future protocol. Passing it through as data would
+    // be worse than refusing it, so the client is expected to be loud.
+    socket.write(encodeFrame({ t: "aria", id: request.id }));
+  });
+  const client = await Client.connect({
+    transport: "unix",
+    path: fixture.path,
+    timeoutMs: 500,
+  });
+  try {
+    await assert.rejects(client.call({ t: "ping" }), (error: unknown) => {
+      assert.ok(error instanceof LugConnectionError);
+      assert.match(error.message, /without a valid id or tag/);
+      return true;
+    });
+  } finally {
+    await client.close();
+    await fixture.close();
+  }
+});
+
+test("a follower refuses to fold across a gap", async () => {
+  const fixture = await unixFixture((request, socket) => {
+    if (request.t === "subscribe") {
+      socket.write(encodeFrame({ t: "ok", id: request.id } satisfies Response));
+      socket.write(
+        encodeFrame({
+          t: "view",
+          id: request.id,
+          version: 7,
+          value: { count: 7 },
+        } satisfies Response),
+      );
+    } else if (request.t === "credit") {
+      socket.write(encodeFrame({ t: "ok", id: request.id } satisfies Response));
+      socket.write(
+        encodeFrame({ t: "gap", id: request.id, from: 7, to: 40 } satisfies Response),
+      );
+    }
+  });
+  const client = await Client.connect({
+    transport: "unix",
+    path: fixture.path,
+    timeoutMs: 500,
+  });
+  try {
+    const follower = await Follower.follow(client, { log: "state" });
+    assert.equal(follower.version, 7);
+    await assert.rejects(follower.finished, (error: unknown) => {
+      assert.ok(error instanceof LugGapError);
+      assert.equal(error.from, 7);
+      assert.equal(error.to, 40);
+      return true;
+    });
+  } finally {
+    await client.close();
+    await fixture.close();
+  }
+});
+
 test("unix subscription grants one credit for each record pull", async () => {
   let credit = 0;
   let resolveCancel!: () => void;
@@ -137,6 +200,8 @@ test("unix subscription grants one credit for each record pull", async () => {
   const fixture = await unixFixture((request, socket) => {
     if (request.t === "subscribe") {
       assert.equal(request.credit, 0);
+      // The daemon opens a subscription with Ok and only then pushes.
+      socket.write(encodeFrame({ t: "ok", id: request.id } satisfies Response));
       socket.write(
         encodeFrame({
           t: "view",
@@ -147,6 +212,7 @@ test("unix subscription grants one credit for each record pull", async () => {
       );
     } else if (request.t === "credit") {
       credit += request.grant;
+      socket.write(encodeFrame({ t: "ok", id: request.id } satisfies Response));
       socket.write(
         encodeFrame({
           t: "records",
@@ -193,6 +259,7 @@ test("follower takes the view preamble and applies streamed cavlc patches", asyn
   let nextPatch = 0;
   const fixture = await unixFixture((request, socket) => {
     if (request.t === "subscribe") {
+      socket.write(encodeFrame({ t: "ok", id: request.id } satisfies Response));
       socket.write(
         encodeFrame({
           t: "view",
@@ -204,6 +271,7 @@ test("follower takes the view preamble and applies streamed cavlc patches", asyn
     } else if (request.t === "credit" && nextPatch < patches.length) {
       const index = nextPatch;
       nextPatch += 1;
+      socket.write(encodeFrame({ t: "ok", id: request.id } satisfies Response));
       socket.write(
         encodeFrame({
           t: "records",
@@ -311,7 +379,7 @@ test("HTTP subscription learns its session and sends credit only on pulls", asyn
       session: header(request.headers["x-lug-session"]),
     });
     if (parsed.t === "credit") {
-      json(response, { t: "pong", id: parsed.id });
+      json(response, { t: "ok", id: parsed.id });
       streamResponse?.write(
         `data: ${JSON.stringify({
           t: "records",
@@ -336,9 +404,8 @@ test("HTTP subscription learns its session and sends credit only on pulls", asyn
     const iterator = client
       .subscribe({ log: "events", from: 3 })
       [Symbol.asyncIterator]();
-    const welcome = await iterator.next();
-    assert.equal(welcome.value?.t, "welcome");
-    assert.equal(controls.length, 0);
+    // The Welcome opens the stream and carries the session. It is not data, so
+    // the first thing a consumer can pull is the first record.
     const record = await iterator.next();
     assert.equal(record.value?.t, "records");
     assert.equal(controls[0]?.request.t, "credit");

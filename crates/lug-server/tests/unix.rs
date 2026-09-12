@@ -222,6 +222,50 @@ async fn reclaimed_cursor_gets_a_gap_and_resumes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deleted_segments_get_a_gap_and_not_a_storage_error() {
+    // The in-memory storage the other retention test uses serves a read below
+    // its floor anyway. Segment files refuse one, which is the case a
+    // subscriber actually meets, so it is worth its own daemon.
+    let lug = Harness::durable_with(|c| {
+        c.segment = lug_server::config::Size(4096);
+        c.ring = 8;
+        c.checkpoint_every = 1;
+    })
+    .await;
+    let mut client = lug.with_log("churn", false).await;
+    let padding = "x".repeat(128);
+    for round in 0..8 {
+        let batch = (0..25).map(|i| json!({ "pad": padding, "n": i })).collect();
+        client.append(10 + round, "churn", batch).await;
+    }
+    let oldest = lug.server().logs().get("churn").expect("log exists").oldest();
+    assert!(oldest > 1, "nothing was reclaimed, oldest is {oldest}");
+
+    client
+        .send(Request::Subscribe {
+            id: 6,
+            log: "churn".into(),
+            from: 0,
+            mode: Mode::Records,
+            credit: 100,
+        })
+        .await;
+    assert!(matches!(client.recv().await, Response::Ok { id: 6 }));
+
+    let resume = match client.recv().await {
+        Response::Gap { from, to, .. } => {
+            assert_eq!(from, 0);
+            assert_eq!(to, oldest - 1);
+            to
+        }
+        other => panic!("expected Gap, got {other:?}"),
+    };
+    assert_eq!(records(&client.recv().await).first(), Some(&(resume + 1)));
+
+    lug.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn foreign_uid_is_refused_on_accept() {
     // Claim to be owned by a uid this test process does not have, which is
     // what the daemon's SO_PEERCRED check has to catch.

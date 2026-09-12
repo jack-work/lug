@@ -54,7 +54,14 @@ impl Harness {
 
     /// The daemon on segment files, where a sync is a real fdatasync.
     pub async fn durable() -> Self {
-        let (mut harness, config) = Self::configured(|_| {});
+        Self::durable_with(|_| {}).await
+    }
+
+    /// Segment files with the config tweaked, for the retention behaviour that
+    /// only the real storage has: a read below `oldest` is refused there, where
+    /// [`MemoryFactory`] quietly serves what it still holds.
+    pub async fn durable_with(tweak: impl FnOnce(&mut Config)) -> Self {
+        let (mut harness, config) = Self::configured(tweak);
         let storage = Segments::new(config.data.clone(), config.segment.0);
         harness.server =
             Some(Server::start(config, storage).await.expect("server starts"));

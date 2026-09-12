@@ -38,6 +38,41 @@ const client = await Client.connect({
 });
 ```
 
-`call` accepts append, read, list, create, and ping requests. Request IDs are allocated by the client. `subscribe` returns an `AsyncIterable<Response>` and grants one record of credit when the consumer pulls. A reducible subscription delivers its view before granting record credit.
+`call` accepts append, read, list, create, and ping requests. Request IDs are
+allocated by the client. `subscribe` returns an `AsyncIterable<Response>` of
+what the stream carries: `view`, `records`, `gap`, `end`. The frames that only
+open or steer a stream never reach the consumer. The daemon answers `Subscribe`
+with `Ok` on a socket and with `Welcome` over SSE, and answers every `Credit`
+with `Ok`; the transport absorbs all three, so an acknowledgement can never be
+mistaken for data.
 
-Protocol `u64` values use JavaScript numbers. Values above `Number.MAX_SAFE_INTEGER` cannot be represented exactly and should not be used with this client.
+Credit is granted one record at a time, when the consumer pulls. A consumer
+that stops pulling stops the daemon pushing. A reducible subscription delivers
+its view before any credit is granted, because the view is not a record.
+
+A `gap` says versions were reclaimed before this subscriber reached them. It is
+part of the stream rather than an error beside it, so a consumer can see what it
+lost. `Follower` cannot fold across one and fails with `LugGapError` instead of
+jumping versions silently.
+
+`Response.View.value` is the bare document. The version is the frame's own
+field, so there is nothing to unwrap.
+
+Protocol `u64` values use JavaScript numbers. A version or id the client cannot
+hold exactly is refused: `at` and `from` throw before anything is sent, and a
+frame carrying one is rejected rather than rounded. Numbers inside a document
+are ordinary JSON and are parsed as doubles, so a value above
+`Number.MAX_SAFE_INTEGER` stored by another client reads back rounded here.
+
+## Tests
+
+```sh
+npm test
+npx tsc --noEmit
+```
+
+`test/interop.test.ts` is a conformance suite against the real daemon: it
+starts `target/release/lug-server` with a generated config in a temp dir and
+drives it over both transports, including the raw frames the client normally
+consumes on the consumer's behalf. Build the workspace first with
+`cargo build --release`; without those binaries the suite skips and says so.

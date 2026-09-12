@@ -268,7 +268,6 @@ where
             return;
         }
         self.shared.ring.push(entries);
-        self.shared.oldest.store(self.log.oldest(), Ordering::Relaxed);
         let watermark = self.log.watermark();
         let _ = self.shared.watermark.send(watermark);
         if self.checkpoint_every > 0 && watermark - self.checkpointed >= self.checkpoint_every {
@@ -277,6 +276,10 @@ where
                 Err(e) => tracing::warn!(error = %e, "automatic checkpoint failed"),
             }
         }
+        // After the checkpoint, because that is what reclaims segments. Read
+        // before it, the published floor names versions storage has already
+        // dropped.
+        self.shared.oldest.store(self.log.oldest(), Ordering::Relaxed);
     }
 
     fn answer(&mut self, command: Command) {
@@ -313,6 +316,14 @@ where
     }
 
     fn catch_up(&self, after: Version, limit: usize) -> Result<CatchUp, Failure> {
+        // Below retention is a gap, not a failure. Segment storage refuses a
+        // read it can no longer serve, and handing that refusal to the
+        // subscriber as Code::Storage would end a stream the protocol says
+        // should resume at the oldest version still readable.
+        let oldest = self.log.oldest();
+        if after + 1 < oldest {
+            return Ok(CatchUp::Gap { to: oldest - 1 });
+        }
         let records =
             self.log.read_after(after, limit).map_err(|e| Failure::new(Code::Storage, e))?;
         match records.first() {

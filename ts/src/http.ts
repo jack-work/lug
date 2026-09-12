@@ -91,9 +91,16 @@ export class HttpTransport implements Transport {
           session,
           true,
         );
-        if (response?.t === "error") {
-          this.#acceptStreamResponse(request.id, stream, response);
+        if (response === undefined || response.t === "ok") {
+          return;
         }
+        if (response.t === "error") {
+          this.#acceptStreamResponse(request.id, stream, response);
+          return;
+        }
+        throw new LugProtocolError(
+          `credit on stream ${request.id} was answered with ${response.t}`,
+        );
       },
       cancel: async () => {
         this.#streams.delete(request.id);
@@ -112,7 +119,7 @@ export class HttpTransport implements Transport {
         }
       },
     };
-    const preambles = request.mode === "reducible" ? 2 : 1;
+    const preambles = request.mode === "reducible" ? 1 : 0;
     return new ControlledSubscription(inbox, preambles, driver);
   }
 
@@ -298,6 +305,13 @@ export class HttpTransport implements Transport {
       }
       stream.sessionValue = response.session;
       stream.resolveSession(response.session);
+      // The Welcome is how the stream opens and where the session comes from,
+      // the SSE counterpart of the Ok a socket sends. It carries no records,
+      // so it stops here rather than reaching the consumer.
+      return;
+    }
+    if (response.t === "ok") {
+      return;
     }
     stream.inbox.push(response);
     if (response.t === "end" || response.t === "error") {
