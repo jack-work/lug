@@ -1,6 +1,6 @@
 [package]
 name = "lug-client"
-description = "placeholder"
+description = "The hub: a pooled, multiplexing lug client and the live-view follower"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,27 @@ license.workspace = true
 
 [dependencies]
 bytes.workspace = true
+cavlc.workspace = true
+clap = { workspace = true, optional = true }
+futures.workspace = true
 lug-core.workspace = true
+lug-proto.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[features]
+default = ["cli"]
+# The `lug` binary. A library consumer can switch it off and skip clap.
+cli = ["dep:clap"]
+
+[[bin]]
+name = "lug"
+path = "src/bin/lug.rs"
+required-features = ["cli"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util", "process"] }

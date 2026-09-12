@@ -26,6 +26,7 @@ lug-wal = { path = "crates/lug-wal" }
 lug-client = { path = "crates/lug-client" }
 
 anyhow = "1"
+clap = { version = "4.5", features = ["derive", "env"] }
 bytes = { version = "1", features = ["serde"] }
 crc32fast = "1.4"
 serde = { version = "1", features = ["derive"] }
