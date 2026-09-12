@@ -4,7 +4,7 @@ use std::io::{Stdout, stdout};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use lug_proto::{Record, Version};
+use lug_proto::{Event as Arrival, Version};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -54,10 +54,15 @@ impl App {
         Self { name, version, body, quit: false }
     }
 
-    fn on_record(&mut self, record: Record) {
-        self.version = record.version;
-        if let Body::Tail(tail) = &mut self.body {
-            tail.push(record);
+    fn on_arrival(&mut self, arrival: Arrival) {
+        self.version = arrival.cursor();
+        match &mut self.body {
+            Body::Tail(tail) => tail.push(arrival),
+            Body::Tree(tree) => {
+                if matches!(arrival, Arrival::Gap { .. }) {
+                    tree.gap();
+                }
+            }
         }
     }
 
@@ -140,6 +145,7 @@ impl App {
         let state = match &self.body {
             Body::Tail(tail) if tail.following() => "tail",
             Body::Tail(_) => "tail paused",
+            Body::Tree(tree) if tree.resynced() => "view resynced",
             Body::Tree(_) => "view",
         };
         let dim = Style::new().fg(json::GUTTER).add_modifier(Modifier::DIM);
@@ -157,7 +163,7 @@ impl App {
 }
 
 pub async fn run(name: String, mode: Mode, mut follower: Box<dyn Follow>) -> Result<()> {
-    let mut records = follower.records();
+    let mut arrivals = follower.events();
     let mut changed = follower.changed();
     let mut app = App::new(name, mode, follower.view());
 
@@ -173,30 +179,43 @@ pub async fn run(name: String, mode: Mode, mut follower: Box<dyn Follow>) -> Res
                 // The reader is gone, so nothing can quit us but a signal.
                 None => app.quit = true,
             },
-            Some(record) = next_record(&mut records) => {
-                app.on_record(record);
-                // One draw for a burst, not one per record.
-                while let Some(more) = records.as_mut().and_then(|r| r.try_recv().ok()) {
-                    app.on_record(more);
-                }
+            Some(arrival) = next_arrival(&mut arrivals) => {
+                app.on_arrival(arrival);
+                drain(&mut arrivals, &mut app);
             }
-            () = next_change(&mut changed) => app.on_view(follower.view()),
+            () = next_change(&mut changed) => on_change(&mut app, &mut arrivals, follower.view()),
             () = at(deadline) => app.expire_flash(),
         }
     }
     Ok(())
 }
 
-async fn next_record(records: &mut Option<mpsc::Receiver<Record>>) -> Option<Record> {
-    match records {
+async fn next_arrival(arrivals: &mut Option<mpsc::Receiver<Arrival>>) -> Option<Arrival> {
+    match arrivals {
         Some(rx) => {
-            let record = rx.recv().await;
-            if record.is_none() {
-                *records = None;
+            let arrival = rx.recv().await;
+            if arrival.is_none() {
+                *arrivals = None;
             }
-            record
+            arrival
         }
         None => std::future::pending().await,
+    }
+}
+
+/// The version moved. Whatever is already queued is read first: a gap is sent
+/// before the view refetched after it, and taking the view alone would diff it
+/// against a state the missing patches never reached, lighting a subtree that
+/// nobody watched change.
+fn on_change(app: &mut App, arrivals: &mut Option<mpsc::Receiver<Arrival>>, view: Option<View>) {
+    drain(arrivals, app);
+    app.on_view(view);
+}
+
+/// One draw for a burst, not one per record.
+fn drain(arrivals: &mut Option<mpsc::Receiver<Arrival>>, app: &mut App) {
+    while let Some(arrival) = arrivals.as_mut().and_then(|rx| rx.try_recv().ok()) {
+        app.on_arrival(arrival);
     }
 }
 
@@ -289,7 +308,7 @@ mod tests {
     #[test]
     fn the_footer_carries_the_name_version_and_state() {
         let mut app = App::new("orders".into(), Mode::Log, None);
-        app.on_record(Record { version: 9, patch: json!({"a": 1}) });
+        app.on_arrival(record(9, json!({"a": 1})));
         let lines = screen(&mut app, 40, 4);
         let footer = lines.last().unwrap();
         assert!(footer.contains("orders"), "{footer:?}");
@@ -302,7 +321,7 @@ mod tests {
     fn scrolling_up_marks_the_tail_paused() {
         let mut app = App::new("orders".into(), Mode::Log, None);
         for v in 1..=20 {
-            app.on_record(Record { version: v, patch: json!({"n": v}) });
+            app.on_arrival(record(v, json!({"n": v})));
         }
         screen(&mut app, 40, 4);
         app.on_event(key(KeyCode::Up));
@@ -324,6 +343,41 @@ mod tests {
     }
 
     #[test]
+    fn a_gap_says_so_in_the_footer_and_forgets_the_old_view() {
+        let view = View { version: 3, value: json!({"a": 1}) };
+        let mut app = App::new("orders".into(), Mode::Reducible, Some(view));
+        app.on_arrival(Arrival::Gap { from: 3, to: 91 });
+        app.on_view(Some(View { version: 91, value: json!({"a": 2}) }));
+        let lines = screen(&mut app, 40, 4);
+        assert!(lines[0].contains("a: 2"), "{lines:?}");
+        assert!(!lines[0].starts_with('▌'), "a refetched view was lit as a change: {lines:?}");
+        let footer = lines.last().expect("a footer").clone();
+        assert!(footer.contains("v91"), "{footer:?}");
+        assert!(footer.contains("view resynced"), "{footer:?}");
+    }
+
+    #[test]
+    fn a_gap_queued_behind_a_version_advance_is_read_first() {
+        let view = View { version: 3, value: json!({"a": 1, "b": 2}) };
+        let mut app = App::new("orders".into(), Mode::Reducible, Some(view));
+
+        // Both are ready at once in the real loop, which is the whole point:
+        // the outcome must not depend on which the runtime notices first.
+        let (tx, rx) = mpsc::channel(4);
+        tx.try_send(Arrival::Gap { from: 3, to: 91 }).expect("queueing the gap");
+        let mut arrivals = Some(rx);
+        on_change(&mut app, &mut arrivals, Some(View { version: 91, value: json!({"a": 5}) }));
+
+        let lines = screen(&mut app, 40, 4);
+        assert!(lines[0].contains("a: 5"), "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.starts_with('▌')),
+            "the view refetched after a gap was diffed against a stale one: {lines:?}"
+        );
+        assert!(lines.last().expect("a footer").contains("view resynced"), "{lines:?}");
+    }
+
+    #[test]
     fn quitting_is_q_esc_and_ctrl_c() {
         for code in [KeyCode::Char('q'), KeyCode::Esc] {
             let mut app = App::new("x".into(), Mode::Log, None);
@@ -336,6 +390,10 @@ mod tests {
             KeyModifiers::CONTROL,
         )));
         assert!(app.quit);
+    }
+
+    fn record(version: u64, patch: serde_json::Value) -> Arrival {
+        Arrival::Record(lug_proto::Record { version, patch })
     }
 
     fn key(code: KeyCode) -> Event {

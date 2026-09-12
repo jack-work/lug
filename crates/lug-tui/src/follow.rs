@@ -5,7 +5,7 @@
 //! means the viewer builds and is tested without a daemon, and the adapter over
 //! `lug_client::Follower` is a handful of lines.
 
-use lug_proto::{Record, Version};
+use lug_proto::{Event, Version};
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 
@@ -19,15 +19,19 @@ pub trait Follow: Send + 'static {
     /// The current view, or `None` when the log is not reducible.
     ///
     /// Must be cheap: it is called from the render loop. A reducible source is
-    /// required to have its first view in hand before it is handed over, so
-    /// `None` here is the signal that reducible mode is not on offer.
+    /// required to have its first view in hand before it is handed over.
     fn view(&self) -> Option<View>;
 
     /// Ticks on every version advance, reducible or not. `*rx.borrow()` is the
     /// version the source is at.
     fn changed(&self) -> watch::Receiver<Version>;
 
-    /// The record stream, in version order. Handed out once; later calls give
+    /// The event stream, in version order. Handed out once; later calls give
     /// `None` because the receiver has already been taken.
-    fn records(&mut self) -> Option<mpsc::Receiver<Record>>;
+    ///
+    /// A [`Event::Gap`] must be queued here *before* the watch ticks with the
+    /// view refetched after it. The viewer reads the gap first and repaints
+    /// wholesale; the other order would diff a fresh view against a state the
+    /// missing patches never reached, and light up the wrong subtree.
+    fn events(&mut self) -> Option<mpsc::Receiver<Event>>;
 }

@@ -8,7 +8,10 @@
 //! First line is the header: `{"reducible": true, "view": {...}}`. Every line
 //! after it is one record: `{"version": 1, "patch": {...}, "view": {...}}`,
 //! where `view` is the state after that patch and is ignored on a
-//! non-reducible log. The file is tailed, so lines appended later arrive later.
+//! non-reducible log. A reclaimed range is `{"gap": {"from": 39, "to": 91},
+//! "view": {...}}`, the view being what a real follower refetches once it
+//! knows the patches it missed are unrecoverable. The file is tailed, so lines
+//! appended later arrive later.
 
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -17,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use lug_proto::{Record, Version};
+use lug_proto::{Event, Record, Version};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
@@ -38,17 +41,31 @@ struct Header {
 }
 
 #[derive(Debug, Deserialize)]
-struct Entry {
-    version: Version,
-    patch: Value,
-    #[serde(default)]
-    view: Option<Value>,
+#[serde(untagged)]
+enum Entry {
+    Record {
+        version: Version,
+        patch: Value,
+        #[serde(default)]
+        view: Option<Value>,
+    },
+    Gap {
+        gap: Range,
+        #[serde(default)]
+        view: Option<Value>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct Range {
+    from: Version,
+    to: Version,
 }
 
 pub struct Script {
     view: Arc<Mutex<Option<View>>>,
     version: watch::Receiver<Version>,
-    records: Option<mpsc::Receiver<Record>>,
+    events: Option<mpsc::Receiver<Event>>,
 }
 
 impl Script {
@@ -61,7 +78,7 @@ impl Script {
 
         let view = Arc::new(Mutex::new(view));
         let (version_tx, version_rx) = watch::channel(0);
-        let (record_tx, record_rx) = mpsc::channel(CAPACITY);
+        let (event_tx, event_rx) = mpsc::channel(CAPACITY);
 
         let tail = Tailer {
             path: path.to_path_buf(),
@@ -69,14 +86,18 @@ impl Script {
             reducible: header.reducible,
             view: Arc::clone(&view),
             version: version_tx,
-            records: record_tx,
+            events: event_tx,
         };
         std::thread::Builder::new()
             .name("lug-tui-script".into())
             .spawn(move || tail.run())
             .context("spawning the script tail thread")?;
 
-        Ok(Self { view, version: version_rx, records: Some(record_rx) })
+        Ok(Self {
+            view,
+            version: version_rx,
+            events: Some(event_rx),
+        })
     }
 }
 
@@ -89,8 +110,8 @@ impl Follow for Script {
         self.version.clone()
     }
 
-    fn records(&mut self) -> Option<mpsc::Receiver<Record>> {
-        self.records.take()
+    fn events(&mut self) -> Option<mpsc::Receiver<Event>> {
+        self.events.take()
     }
 }
 
@@ -126,7 +147,7 @@ struct Tailer {
     reducible: bool,
     view: Arc<Mutex<Option<View>>>,
     version: watch::Sender<Version>,
-    records: mpsc::Sender<Record>,
+    events: mpsc::Sender<Event>,
 }
 
 impl Tailer {
@@ -146,7 +167,7 @@ impl Tailer {
                 Err(_) => return,
             };
             if read == 0 {
-                if self.records.is_closed() {
+                if self.events.is_closed() {
                     return;
                 }
                 std::thread::sleep(IDLE);
@@ -170,15 +191,23 @@ impl Tailer {
         let Ok(entry) = serde_json::from_slice::<Entry>(line) else {
             return true;
         };
-        if self.reducible && let Some(value) = entry.view {
-            let mut slot = self.view.lock().expect("script view mutex poisoned");
-            *slot = Some(View { version: entry.version, value });
-        }
-        let record = Record { version: entry.version, patch: entry.patch };
-        if self.records.blocking_send(record).is_err() {
+        let (event, view) = match entry {
+            Entry::Record { version, patch, view } => {
+                (Event::Record(Record { version, patch }), view)
+            }
+            Entry::Gap { gap, view } => (Event::Gap { from: gap.from, to: gap.to }, view),
+        };
+        let version = event.cursor();
+
+        // The event goes out first: the viewer has to know a gap happened
+        // before it is handed the view that came after it.
+        if self.events.blocking_send(event).is_err() {
             return false;
         }
-        // After the view, so a woken reducible viewer never reads stale state.
-        self.version.send(entry.version).is_ok()
+        if self.reducible && let Some(value) = view {
+            let mut slot = self.view.lock().expect("script view mutex poisoned");
+            *slot = Some(View { version, value });
+        }
+        self.version.send(version).is_ok()
     }
 }

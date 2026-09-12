@@ -220,6 +220,10 @@ fn record_with_view(version: u64, patch: &str, view: &str) -> String {
     format!(r#"{{"version": {version}, "patch": {patch}, "view": {view}}}"#)
 }
 
+fn gap(from: u64, to: u64, view: &str) -> String {
+    format!(r#"{{"gap": {{"from": {from}, "to": {to}}}, "view": {view}}}"#)
+}
+
 #[test]
 fn it_starts_and_paints() {
     need_tmux!();
@@ -308,6 +312,58 @@ fn reducible_mode_repaints_with_the_changed_subtree_lit() {
 
     let calm = pane.wait_gone("▌");
     assert!(calm.contains("total: 42"), "the view vanished with the highlight:\n{calm}");
+}
+
+#[test]
+fn a_gap_in_the_tail_is_drawn_and_not_skipped() {
+    need_tmux!();
+    let script = Script::new("gap", HEADER_PLAIN);
+    script.append(&record(39, r#"{"k": "before"}"#));
+    let pane = Pane::run("gap", 70, 10, &[BIN, "--script", &script.arg(), "orders"]);
+    pane.wait_for("before");
+
+    script.append(&gap(39, 91, "null"));
+    script.append(&record(92, r#"{"k": "after"}"#));
+    let screen = pane.wait_for("after");
+
+    let rows: Vec<&str> = screen.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert!(rows[0].contains("before"), "{screen}");
+    assert!(
+        rows[1].contains("records 40 through 91 are gone"),
+        "the reclaimed range is invisible:\n{screen}"
+    );
+    assert!(rows[2].contains("after"), "{screen}");
+}
+
+#[test]
+fn a_gap_in_reducible_mode_repaints_wholesale() {
+    need_tmux!();
+    let script = Script::new("gapview", HEADER_REDUCIBLE);
+    let pane =
+        Pane::run("gapview", 60, 12, &[BIN, "--script", &script.arg(), "--reducible", "orders"]);
+    script.append(&record_with_view(
+        1,
+        r#"{"op": "set"}"#,
+        r#"{"count": 1, "orders": {"a1": {"total": 42}}}"#,
+    ));
+    pane.wait_for("total: 42");
+    pane.wait_gone("▌");
+
+    // What a follower refetches after learning the patches it missed are gone.
+    script.append(&gap(1, 91, r#"{"count": 12, "orders": {"z9": {"total": 7}}}"#));
+    let screen = pane.wait_for("z9");
+
+    assert!(!screen.contains("a1"), "the stale view survived the gap:\n{screen}");
+    assert!(
+        !screen.lines().any(|l| l.starts_with('▌')),
+        "a refetched view was lit as if its patches had been watched:\n{screen}"
+    );
+    let footer = screen.lines().last().unwrap_or_default();
+    assert!(footer.contains("v91"), "{footer:?}");
+    assert!(footer.contains("view resynced"), "the gap left no trace: {footer:?}");
+
+    let settled = pane.wait_gone("resynced");
+    assert!(settled.contains("total: 7"), "the view went with the notice:\n{settled}");
 }
 
 #[test]

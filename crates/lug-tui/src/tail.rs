@@ -2,10 +2,10 @@
 
 use std::collections::VecDeque;
 
-use lug_proto::Record;
+use lug_proto::Event;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -16,6 +16,9 @@ const KEEP: usize = 4096;
 
 /// Dropping one record at a time would re-flow the cache on every arrival.
 const TRIM_BATCH: usize = 256;
+
+/// As wide as the version gutter, so a rule lines up with the records.
+const GUTTER_PAD: &str = "        ";
 
 #[derive(Default)]
 pub struct Tail {
@@ -28,7 +31,7 @@ pub struct Tail {
 }
 
 struct Entry {
-    record: Record,
+    event: Event,
     lines: Vec<Line<'static>>,
 }
 
@@ -38,17 +41,17 @@ impl Tail {
         self.offset == 0
     }
 
-    pub fn push(&mut self, record: Record) {
+    pub fn push(&mut self, event: Event) {
         if self.entries.len() >= KEEP + TRIM_BATCH {
             self.entries.drain(..TRIM_BATCH);
         }
-        let lines = render(&record, self.width);
+        let lines = render(&event, self.width);
         // Scrolled-back readers keep looking at the same rows while the bottom
         // grows underneath them.
         if self.offset > 0 {
             self.offset += lines.len();
         }
-        self.entries.push_back(Entry { record, lines });
+        self.entries.push_back(Entry { event, lines });
     }
 
     pub fn scroll(&mut self, delta: isize) {
@@ -77,7 +80,7 @@ impl Tail {
         if area.width != self.width {
             self.width = area.width;
             for entry in &mut self.entries {
-                entry.lines = render(&entry.record, self.width);
+                entry.lines = render(&entry.event, self.width);
             }
             // Widths change line counts, and an offset in the old units is a
             // lie. Resizing while scrolled back lands you at the bottom.
@@ -104,23 +107,42 @@ impl Tail {
     }
 }
 
-fn render(record: &Record, width: u16) -> Vec<Line<'static>> {
-    let gutter = Span::styled(
-        format!("{:>7} ", record.version),
-        Style::new().fg(json::GUTTER).add_modifier(ratatui::style::Modifier::DIM),
-    );
-    json::wrap(gutter, &json::spans(&record.patch), width as usize)
+fn render(event: &Event, width: u16) -> Vec<Line<'static>> {
+    match event {
+        Event::Record(record) => {
+            let gutter = Span::styled(
+                format!("{:>7} ", record.version),
+                Style::new().fg(json::GUTTER).add_modifier(Modifier::DIM),
+            );
+            json::wrap(gutter, &json::spans(&record.patch), width as usize)
+        }
+        Event::Gap { from, to } => vec![rule(*from + 1, *to, width as usize)],
+    }
+}
+
+/// A reclaimed range is drawn, not skipped. The versions either side of it are
+/// contiguous on screen and would otherwise read as if nothing were missing.
+fn rule(first: u64, last: u64, width: usize) -> Line<'static> {
+    let text = format!("{GUTTER_PAD}── records {first} through {last} are gone ");
+    let fill = width.saturating_sub(json::display_width(&text));
+    let mut line = text;
+    line.extend(std::iter::repeat_n('─', fill));
+    Line::from(Span::styled(
+        line.chars().take(width).collect::<String>(),
+        Style::new().fg(json::GUTTER).add_modifier(Modifier::DIM),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lug_proto::Record;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use serde_json::json;
 
-    fn record(version: u64) -> Record {
-        Record { version, patch: json!({ "n": version }) }
+    fn record(version: u64) -> Event {
+        Event::Record(Record { version, patch: json!({ "n": version }) })
     }
 
     fn draw(tail: &mut Tail, width: u16, height: u16) -> Vec<String> {
@@ -189,6 +211,31 @@ mod tests {
         assert_eq!(tail.offset, 2, "scrolled past the oldest record");
         tail.scroll(-100);
         assert_eq!(tail.offset, 0);
+    }
+
+    #[test]
+    fn a_gap_is_drawn_between_the_records_it_separates() {
+        let mut tail = Tail::default();
+        tail.push(record(39));
+        tail.push(Event::Gap { from: 39, to: 91 });
+        tail.push(record(92));
+        let screen = draw(&mut tail, 60, 3);
+        assert!(screen[0].contains("39"), "{screen:?}");
+        assert!(screen[1].contains("records 40 through 91 are gone"), "{screen:?}");
+        assert!(screen[2].contains("92"), "{screen:?}");
+    }
+
+    #[test]
+    fn a_gap_rule_fits_a_narrow_pane() {
+        let mut tail = Tail::default();
+        tail.push(Event::Gap { from: 39, to: 91 });
+        for width in [20u16, 34, 80] {
+            let screen = draw(&mut tail, width, 1);
+            assert!(
+                crate::json::display_width(&screen[0]) <= width as usize,
+                "the rule outran a {width} column pane: {screen:?}"
+            );
+        }
     }
 
     #[test]

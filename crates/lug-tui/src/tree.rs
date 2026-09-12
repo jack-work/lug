@@ -23,6 +23,12 @@ pub struct Tree {
     previous: Option<Value>,
     lines: Vec<Node>,
     flash_until: Option<Instant>,
+    /// Set by a gap and by the first paint, consumed by the next view: neither
+    /// has a baseline it can honestly call the state this view moved from.
+    resync: bool,
+    /// Set by a gap and cleared when the highlight fades, so the footer can
+    /// say the view was refetched rather than folded.
+    resynced: bool,
     offset: usize,
     height: usize,
 }
@@ -39,26 +45,41 @@ impl Tree {
             previous: None,
             lines: Vec::new(),
             flash_until: None,
+            // Nothing has moved yet: the first paint is state, not a change.
+            resync: true,
+            resynced: false,
             offset: 0,
             height: 0,
         };
         tree.update(value);
-        // Nothing has moved yet; the first paint is state, not a change.
-        tree.flash_until = None;
-        for line in &mut tree.lines {
-            line.changed = false;
-        }
         tree
     }
 
     pub fn update(&mut self, value: &Value) {
-        self.lines = flatten(value, self.previous.as_ref());
+        // Resyncing, the state on screen never folded into this view, because
+        // the patches between them were reclaimed. Diffing the view against
+        // itself is what saying "nothing here was watched changing" looks like.
+        let baseline = if self.resync { Some(value) } else { self.previous.as_ref() };
+        self.resync = false;
+        self.lines = flatten(value, baseline);
         if self.lines.iter().any(|l| l.changed) {
             self.flash_until = Some(Instant::now() + FLASH);
         }
         self.previous = Some(value.clone());
         let max = self.lines.len().saturating_sub(self.height);
         self.offset = self.offset.min(max);
+    }
+
+    /// Records were reclaimed, so the state this tree is showing never folded
+    /// into the one that comes next. Forget it and repaint whole.
+    pub fn gap(&mut self) {
+        self.resync = true;
+        self.resynced = true;
+        self.flash_until = Some(Instant::now() + FLASH);
+    }
+
+    pub fn resynced(&self) -> bool {
+        self.resynced
     }
 
     /// When the highlight should be repainted away, if it is lit.
@@ -68,6 +89,7 @@ impl Tree {
 
     pub fn expire_flash(&mut self) {
         self.flash_until = None;
+        self.resynced = false;
     }
 
     /// Positive scrolls up, towards the root, as in the tail.
@@ -91,7 +113,7 @@ impl Tree {
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         self.height = area.height as usize;
         if self.flash_until.is_some_and(|at| at <= Instant::now()) {
-            self.flash_until = None;
+            self.expire_flash();
         }
         let lit = self.flash_until.is_some();
 
@@ -283,6 +305,38 @@ mod tests {
         let lit: Vec<String> =
             text(&tree).into_iter().filter(|(_, c)| *c).map(|(t, _)| t).collect();
         assert_eq!(lit, vec!["a: 7".to_owned()]);
+    }
+
+    #[test]
+    fn a_gap_repaints_whole_and_lights_nothing() {
+        let mut tree = Tree::new(&json!({"a": 1, "b": {"c": 2}}));
+        tree.gap();
+        // The view a follower refetches, nothing like what was on screen.
+        tree.update(&json!({"a": 9, "b": {"c": 9}, "d": 1}));
+        let lines: Vec<String> = text(&tree).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(
+            lines,
+            vec![
+                "a: 9".to_owned(),
+                "b {1}".to_owned(),
+                "  c: 9".to_owned(),
+                "d: 1".to_owned(),
+            ]
+        );
+        assert!(text(&tree).iter().all(|(_, c)| !c), "a refetched view claimed to have changed");
+        assert!(tree.resynced(), "the gap left no trace for the footer");
+    }
+
+    #[test]
+    fn a_patch_landing_inside_the_resync_notice_still_lights_its_change() {
+        let mut tree = Tree::new(&json!({"a": 1}));
+        tree.gap();
+        tree.update(&json!({"a": 9, "b": 1}));
+        // Still inside the notice, but this one was watched arriving.
+        tree.update(&json!({"a": 10, "b": 1}));
+        let lit: Vec<String> =
+            text(&tree).into_iter().filter(|(_, c)| *c).map(|(t, _)| t).collect();
+        assert_eq!(lit, vec!["a: 10".to_owned()]);
     }
 
     #[test]
