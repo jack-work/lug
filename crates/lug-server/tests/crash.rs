@@ -49,12 +49,17 @@ impl Drop for Daemon {
 }
 
 fn write_config(dir: &Path) -> (PathBuf, PathBuf) {
+    config_with(dir, 10_000)
+}
+
+fn config_with(dir: &Path, checkpoint_every: u64) -> (PathBuf, PathBuf) {
     let config = dir.join("lug.toml");
     let run = dir.join("run");
     std::fs::write(
         &config,
         format!(
-            "data = {:?}\nrun = {:?}\nsocket = \"lug.sock\"\nsegment = \"4MiB\"\nring = 1024\n",
+            "data = {:?}\nrun = {:?}\nsocket = \"lug.sock\"\nsegment = \"4MiB\"\n\
+             ring = 1024\ncheckpoint_every = {checkpoint_every}\n",
             dir.join("data"),
             run,
         ),
@@ -138,16 +143,17 @@ async fn sigkill_then_restart_recovers_every_acknowledged_append() {
     assert!(matches!(client.recv().await, Response::Ok { id: 3 }));
     assert_eq!(common::records(&client.recv().await), vec![1, 2, 3, 4, 5]);
 
-    // Appends continue from where recovery left off.
-    let ack = client
-        .call(Request::Append {
+    // Appends continue from where recovery left off. The live subscription
+    // above is pushing on the same connection, so pick the Ack out by id.
+    client
+        .send(Request::Append {
             id: 4,
             log: "events".into(),
             patches: vec![json!({ "tick": 5 })],
             durability: Durability::Durable,
         })
         .await;
-    assert_eq!(common::versions(&ack), vec![6]);
+    assert_eq!(common::versions(&client.recv_for(4).await), vec![6]);
 }
 
 #[test]
@@ -198,4 +204,40 @@ async fn sigterm_unlinks_the_socket() {
     }
     assert!(!socket.exists(), "SIGTERM should unlink the socket");
     let _ = daemon.child.wait();
+}
+
+/// Recovery has to agree with the checkpoints taken along the way: the header
+/// covers the versions below it and the records above it are replayed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checkpoints_taken_along_the_way_recover_to_the_same_state() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (config, socket) = config_with(dir.path(), 5);
+
+    let mut daemon = Daemon::start(&config, &socket);
+    let mut client = Client::connect(&socket).await;
+    client.call(Request::Create { id: 1, log: "counted".into(), reducible: true }).await;
+    for round in 0..23u64 {
+        let ack = client
+            .call(Request::Append {
+                id: 100 + round,
+                log: "counted".into(),
+                patches: vec![json!({ "Create": { format!("k{round}"): round } })],
+                durability: Durability::Written,
+            })
+            .await;
+        assert_eq!(common::versions(&ack), vec![round + 1]);
+    }
+    drop(client);
+    daemon.kill_hard();
+
+    let _restarted = Daemon::start(&config, &socket);
+    let mut client = Client::connect(&socket).await;
+    match client.call(Request::Read { id: 1, log: "counted".into(), at: None }).await {
+        Response::View { version, value, .. } => {
+            assert_eq!(version, 23);
+            assert_eq!(value["root"]["k0"], json!(0));
+            assert_eq!(value["root"]["k22"], json!(22));
+        }
+        other => panic!("expected View, got {other:?}"),
+    }
 }

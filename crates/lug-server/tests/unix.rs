@@ -389,17 +389,37 @@ async fn a_reducible_log_materializes_a_view() {
     assert!(matches!(client.recv().await, Response::Ok { id: 4 }));
     assert!(matches!(client.recv().await, Response::View { id: 4, version: 2, .. }));
 
+    client
+        .send(Request::Append {
+            id: 5,
+            log: "store".into(),
+            patches: vec![json!({ "Create": { "c": 3 } })],
+            durability: Durability::Written,
+        })
+        .await;
+    // The ack and the push race; both must show up.
+    let mut pushed = None;
+    let mut acked = false;
+    while pushed.is_none() || !acked {
+        match client.recv().await {
+            Response::Records { id: 4, records } => {
+                pushed = Some(records.iter().map(|r| r.version).collect::<Vec<_>>())
+            }
+            Response::Ack { id: 5, .. } => acked = true,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(pushed, Some(vec![3]));
+
+    // A patch the structure rejects is the caller's fault, and says so.
     client.send(Request::Append {
-        id: 5,
+        id: 6,
         log: "store".into(),
-        patches: vec![json!({ "Create": { "c": 3 } })],
+        patches: vec![json!({ "Nonsense": {} })],
         durability: Durability::Written,
     })
     .await;
-    assert_eq!(records(&client.recv_for(4).await), vec![3]);
-
-    // A patch the structure rejects is the caller's fault, and says so.
-    match client.append(6, "store", vec![json!({ "Nonsense": {} })]).await {
+    match client.recv_for(6).await {
         Response::Error { code: Code::Rejected, .. } => {}
         other => panic!("expected Rejected, got {other:?}"),
     }

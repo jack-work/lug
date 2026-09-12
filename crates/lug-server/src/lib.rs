@@ -93,6 +93,8 @@ impl Server {
                 .await
                 .with_context(|| format!("binding http {addr}"))?;
             http = Some(listener.local_addr()?);
+            // The bearer token is the boundary here, so an authenticated HTTP
+            // caller acts as the owner; there are no peer credentials to read.
             let api = http::Api::new(logs.clone(), acl.clone(), limits, owner, token);
             let mut stopping = stopping.clone();
             tasks.push(tokio::spawn(async move {
