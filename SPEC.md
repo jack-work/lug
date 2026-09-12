@@ -158,6 +158,37 @@ the least-loaded connection, not round-robin.
 - Bounded channels everywhere. A wedged client must be slowed or dropped,
   never allowed to grow the daemon's heap.
 
+## CLI
+
+```
+lug-server [--config <path>]
+```
+
+Config is TOML; every key has a flag override of the same name.
+
+```toml
+data      = "/var/lib/lug"      # segment directories, one per log
+run       = "/run/lug"          # created 0700 before the socket is bound
+socket    = "lug.sock"          # relative to run
+http      = "127.0.0.1:7717"    # omit to disable HTTP
+token     = "/etc/lug/token"    # bearer token file, 0600, never logged
+allow_uid = []                  # additional uids beyond the daemon's own
+segment   = "64MiB"
+ring      = 4096                # records held in memory per log for fan-out
+checkpoint_every = 10000        # versions between automatic checkpoints
+```
+
+`--check` validates config and exits. `lug-server` runs in the foreground and
+logs to stderr; it never forks. The supervisor owns the process.
+
+```
+lug <command>
+```
+
+A client CLI over the same hub: `lug ls`, `lug create <log> [--reducible]`,
+`lug append <log> [-]`, `lug tail <log> [--from N]`, `lug read <log> [--at N]`.
+`--socket <path>` or `--http <url>` chooses the transport; unix is default.
+
 ## Rules
 
 - Comments explain why, never what. No comment restates its line.
