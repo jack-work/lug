@@ -8,7 +8,7 @@ export class FrameError extends Error {
   }
 }
 
-export function encodeFrame(value: unknown): Uint8Array {
+export function encodeFrame(value: unknown, maxFrame = MAX_FRAME): Uint8Array {
   let json: string | undefined;
   try {
     json = JSON.stringify(value);
@@ -20,9 +20,9 @@ export function encodeFrame(value: unknown): Uint8Array {
   }
 
   const body = new TextEncoder().encode(json);
-  if (body.byteLength > MAX_FRAME) {
+  if (body.byteLength > maxFrame) {
     throw new FrameError(
-      `frame of ${body.byteLength} bytes exceeds the ${MAX_FRAME} byte limit`,
+      `frame of ${body.byteLength} bytes exceeds the ${maxFrame} byte limit`,
     );
   }
 

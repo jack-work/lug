@@ -58,7 +58,13 @@ export type Code =
   | "internal";
 
 export type Response =
-  | { t: "welcome"; id: Id; version: number; max_frame: number }
+  | {
+      t: "welcome";
+      id: Id;
+      version: number;
+      max_frame: number;
+      session?: string;
+    }
   | { t: "ack"; id: Id; versions: Version[]; synced: Version }
   | { t: "records"; id: Id; records: Record[] }
   | { t: "view"; id: Id; version: Version; value: JsonValue }
