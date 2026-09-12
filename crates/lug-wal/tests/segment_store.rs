@@ -292,3 +292,19 @@ fn a_corrupt_header_is_refused_rather_than_ignored() {
         .expect("a bad header checksum must fail loudly");
     assert!(matches!(err, Error::HeaderChecksum { .. }), "{err}");
 }
+
+#[test]
+fn a_segment_is_sized_before_it_is_written() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut wal = store(dir.path(), 1 << 16);
+    wal.append(&records(1..=3)).expect("append");
+    wal.sync().expect("sync");
+
+    // Records land inside a region that already has its size and its blocks,
+    // which is what lets sync be fdatasync and touch no metadata.
+    let meta = std::fs::metadata(segment_files(dir.path()).remove(0)).expect("stat");
+    assert_eq!(meta.len(), 1 << 16, "the segment was not sized up front");
+    assert!(meta.blocks() * 512 >= data_end(1, 3), "no blocks were reserved");
+}
