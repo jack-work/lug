@@ -1,6 +1,6 @@
 import { applyCavlcPatch, type CavlcPatch, type JsonObject } from "./cavlc.js";
 import type { Client } from "./client.js";
-import { LugProtocolError } from "./errors.js";
+import { LugGapError, LugProtocolError } from "./errors.js";
 import type { JsonValue, Response, Version } from "./types.js";
 
 export interface FollowerOptions {
@@ -39,34 +39,32 @@ export class Follower {
         : { log: options.log, from: options.from, mode: "reducible" as const };
     const iterator = client.subscribe(subscription)[Symbol.asyncIterator]();
     try {
-      for (;;) {
-        const next = await iterator.next();
-        if (next.done) {
-          throw new LugProtocolError("reducible subscription ended before its view");
-        }
-        const response = next.value;
-        if (response.t === "welcome") {
-          continue;
-        }
-        if (response.t === "error") {
-          throw serverError(response);
-        }
-        if (response.t !== "view" || !isObject(response.value)) {
-          throw new LugProtocolError(
-            `expected a reducible view preamble, received ${response.t}`,
-          );
-        }
-        const follower = new Follower(
-          iterator,
-          cloneObject(response.value),
-          response.version,
-          options.onChange,
-        );
-        follower.#notify();
-        follower.#finished = follower.#run();
-        void follower.#finished.catch(() => undefined);
-        return follower;
+      const next = await iterator.next();
+      if (next.done) {
+        throw new LugProtocolError("reducible subscription ended before its view");
       }
+      // The server acknowledges a subscription before it pushes anything, and
+      // the transports absorb that acknowledgement, so a reducible stream
+      // opens on its view and nothing else.
+      const response = next.value;
+      if (response.t === "error") {
+        throw serverError(response);
+      }
+      if (response.t !== "view" || !isObject(response.value)) {
+        throw new LugProtocolError(
+          `expected a reducible view preamble, received ${response.t}`,
+        );
+      }
+      const follower = new Follower(
+        iterator,
+        cloneObject(response.value),
+        response.version,
+        options.onChange,
+      );
+      follower.#notify();
+      follower.#finished = follower.#run();
+      void follower.#finished.catch(() => undefined);
+      return follower;
     } catch (error) {
       await iterator.return?.();
       throw error;
@@ -120,9 +118,7 @@ export class Follower {
             }
             break;
           case "gap":
-            throw new LugProtocolError(
-              `follower lost retained versions (${response.from}, ${response.to}]`,
-            );
+            throw new LugGapError(response.from, response.to);
           case "error":
             throw serverError(response);
           case "end":

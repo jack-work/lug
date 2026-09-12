@@ -70,6 +70,8 @@ export type Response =
   | { t: "view"; id: Id; version: Version; value: JsonValue }
   | { t: "gap"; id: Id; from: Version; to: Version }
   | { t: "logs"; id: Id; logs: LogInfo[] }
+  // Answers Credit, and opens a subscription before any record is pushed.
+  | { t: "ok"; id: Id }
   | { t: "end"; id: Id }
   | { t: "pong"; id: Id }
   | { t: "error"; id: Id; code: Code; message: string };

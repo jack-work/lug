@@ -44,6 +44,7 @@ export function isResponse(value: unknown): value is Response {
       return isVersion(value.from) && isVersion(value.to);
     case "logs":
       return Array.isArray(value.logs) && value.logs.every(isLogInfo);
+    case "ok":
     case "end":
     case "pong":
       return true;

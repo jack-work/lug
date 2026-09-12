@@ -53,12 +53,18 @@ export class Client {
   public call(request: CallRequest, timeoutMs = this.#timeoutMs): Promise<Response> {
     this.#ensureOpen();
     checkTimeout(timeoutMs);
+    if (request.t === "read" && request.at !== undefined) {
+      checkVersion(request.at, "at");
+    }
     const id = this.#allocateId();
     return this.#transport.call(withId(request, id), timeoutMs);
   }
 
   public subscribe(options: SubscriptionOptions): AsyncIterable<Response> {
     this.#ensureOpen();
+    if (options.from !== undefined) {
+      checkVersion(options.from, "from");
+    }
     const request: Extract<Request, { t: "subscribe" }> = {
       t: "subscribe",
       id: this.#allocateId(),
@@ -127,6 +133,17 @@ function withId(request: CallRequest, id: Id): Request {
 function checkTimeout(timeoutMs: number): void {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw new TypeError(`timeoutMs must be positive, received ${timeoutMs}`);
+  }
+}
+
+// A version is a u64 on the wire and a double here. Sending one the client
+// cannot hold exactly would ask the server about a version nobody named, so
+// it is refused where the caller can still see it.
+function checkVersion(version: number, field: string): void {
+  if (!Number.isSafeInteger(version) || version < 0) {
+    throw new TypeError(
+      `${field} must be a version below Number.MAX_SAFE_INTEGER, received ${version}`,
+    );
   }
 }
 

@@ -28,3 +28,16 @@ export class LugProtocolError extends LugClientError {
     this.name = "LugProtocolError";
   }
 }
+
+// Versions in `(from, to]` were reclaimed before the follower reached them.
+export class LugGapError extends LugProtocolError {
+  public readonly from: number;
+  public readonly to: number;
+
+  public constructor(from: number, to: number) {
+    super(`versions (${from}, ${to}] were reclaimed before this follower read them`);
+    this.name = "LugGapError";
+    this.from = from;
+    this.to = to;
+  }
+}

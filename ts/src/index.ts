@@ -12,6 +12,7 @@ export type { FollowerOptions } from "./follower.js";
 export {
   LugClientError,
   LugConnectionError,
+  LugGapError,
   LugProtocolError,
   LugTimeoutError,
 } from "./errors.js";

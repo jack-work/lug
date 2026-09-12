@@ -141,6 +141,8 @@ export class UnixTransport implements Transport {
         }
       },
     };
+    // Only the view preamble of a reducible stream arrives uncharged; every
+    // record after it costs credit.
     return new ControlledSubscription(
       inbox,
       request.mode === "reducible" ? 1 : 0,
@@ -207,6 +209,13 @@ export class UnixTransport implements Transport {
       }
       const stream = this.#streams.get(response.id);
       if (stream !== undefined) {
+        // A stream id names both the subscription and the credit calls that
+        // steer it, so the Ok that opens the stream and the Ok that answers
+        // each grant arrive here. Neither is stream data, and handing them to
+        // the consumer would present an acknowledgement as a record.
+        if (response.t === "ok") {
+          continue;
+        }
         stream.inbox.push(response);
         if (response.t === "end" || response.t === "error") {
           this.#streams.delete(response.id);
