@@ -16,3 +16,8 @@ thiserror.workspace = true
 [features]
 default = ["cavlc"]
 cavlc = ["dep:cavlc"]
+
+[dev-dependencies]
+cavlc.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

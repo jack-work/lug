@@ -44,4 +44,8 @@ impl Reducible for Store {
         Store::truncate(self, version);
         Ok(())
     }
+
+    fn resume(view: Snapshot) -> Result<Self, Error> {
+        Ok(Store::resume(view))
+    }
 }

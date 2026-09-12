@@ -56,6 +56,13 @@ pub trait Reducible: Send + 'static {
     /// memory, so that memory never runs ahead of the write-ahead log.
     fn truncate(&mut self, version: Version) -> Result<(), Self::Error>;
 
+    /// Rebuild from a checkpointed pointer. The result sits at
+    /// `view.version()` and retains no history below it, which is what lets
+    /// recovery skip every record the checkpoint covers.
+    fn resume(view: Self::View) -> Result<Self, Self::Error>
+    where
+        Self: Sized;
+
     fn version(&self) -> Version {
         self.view().version()
     }
@@ -126,5 +133,9 @@ impl Reducible for Noop {
     fn truncate(&mut self, version: Version) -> Result<(), Overflow> {
         self.version = self.version.min(version);
         Ok(())
+    }
+
+    fn resume(view: Tick) -> Result<Self, Overflow> {
+        Ok(Self { version: view.0 })
     }
 }

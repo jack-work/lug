@@ -58,10 +58,26 @@ where
     S: Storage<View = D::View>,
 {
     /// Recover from storage: adopt the checkpointed header if there is one,
-    /// then replay the records after it.
-    pub fn open(mut data: D, mut storage: S) -> Result<Self, LogError<D, S>> {
+    /// then replay the records above it.
+    ///
+    /// `zero` is used only when storage holds no header. A header replaces it
+    /// outright, which is the point of checkpointing: the records it covers
+    /// are never replayed.
+    pub fn open(zero: D, mut storage: S) -> Result<Self, LogError<D, S>>
+    where
+        D: Sized,
+    {
         let recovered = storage.load().map_err(Error::Storage)?;
+        let mut data = match recovered.header {
+            Some(view) => D::resume(view).map_err(Error::Data)?,
+            None => zero,
+        };
         for record in &recovered.tail {
+            if record.version <= data.version() {
+                // Covered by the checkpoint. Storage may hand back records it
+                // has not reclaimed yet; skipping them is not an error.
+                continue;
+            }
             let patch: D::Patch = serde_json::from_slice(&record.patch)?;
             let mut staged = data.stage();
             data.stage_patch(&mut staged, &patch).map_err(Error::Data)?;
@@ -180,5 +196,10 @@ where
     fn unwind<T>(&mut self, base: Version, err: LogError<D, S>) -> Result<T, LogError<D, S>> {
         let _ = self.data.truncate(base);
         Err(err)
+    }
+
+    /// Take the log apart, for tests and for handing storage to a new log.
+    pub fn into_parts(self) -> (D, S) {
+        (self.data, self.storage)
     }
 }
