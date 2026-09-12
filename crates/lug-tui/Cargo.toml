@@ -1,14 +1,14 @@
 [package]
 name = "lug-tui"
-description = "placeholder"
+description = "A thin viewer over a lug log: a tail, or a live materialized view"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-bytes.workspace = true
-lug-core.workspace = true
+anyhow.workspace = true
+lug-proto.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
+tokio = { workspace = true }

@@ -339,11 +339,11 @@ dependencies = [
 name = "lug-tui"
 version = "0.1.0"
 dependencies = [
- "bytes",
- "lug-core",
+ "anyhow",
+ "lug-proto",
  "serde",
  "serde_json",
- "thiserror",
+ "tokio",
 ]
 
 [[package]]
