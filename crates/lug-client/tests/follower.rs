@@ -251,3 +251,67 @@ async fn clones_see_the_same_stream() {
     );
     assert_eq!(follower.version(), target);
 }
+
+#[tokio::test]
+async fn the_gap_is_queued_before_the_refetched_version_wakes_a_renderer() {
+    use futures::task::{ArcWake, waker};
+    use std::future::Future;
+    use std::sync::Mutex;
+    use std::task::Context;
+    use tokio::sync::mpsc;
+
+    struct Renderer {
+        events: Mutex<mpsc::Receiver<Event>>,
+        observations: Mutex<Vec<Vec<Event>>>,
+        follower: lug_client::Follower,
+        views: Mutex<Vec<u64>>,
+    }
+
+    impl ArcWake for Renderer {
+        fn wake_by_ref(this: &Arc<Self>) {
+            // Observe at the notification itself, not after the producer gets
+            // another turn to repair an incorrectly ordered publication.
+            let mut events = this.events.lock().unwrap();
+            let mut available = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                available.push(event);
+            }
+            this.observations.lock().unwrap().push(available);
+            this.views.lock().unwrap().push(this.follower.state().version);
+        }
+    }
+
+    let mock = Mock::start("gap-order").await;
+    mock.sim.append(&[create("seed", json!(1))]).expect("seed");
+    let hub = Hub::builder(mock.transport()).connections(1).connect().await.expect("connect");
+    let mut follower = hub.follow("log").await.expect("follow");
+    follower.wait_for(1).await.expect("preamble");
+    let renderer = Arc::new(Renderer {
+        events: Mutex::new(follower.records().expect("events")),
+        observations: Mutex::new(Vec::new()),
+        follower: follower.clone(),
+        views: Mutex::new(Vec::new()),
+    });
+    let mut versions = follower.changed();
+    versions.borrow_and_update();
+    let notification = versions.changed();
+    futures::pin_mut!(notification);
+    let waker = waker(renderer.clone());
+    assert!(notification.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+
+    // No await between these: the subscriber cannot see the hidden record
+    // before retention removes it, on this current-thread runtime.
+    mock.sim.append(&[create("hidden", json!(2))]).expect("hidden");
+    mock.sim.reclaim(2);
+    mock.sim.append(&[create("after", json!(3))]).expect("after");
+    tokio::time::timeout(Duration::from_secs(5), follower.wait_for(3))
+        .await.expect("recovery deadline").expect("recovered");
+
+    let observations = renderer.observations.lock().unwrap();
+    assert!(!observations.is_empty(), "the version watch did not wake");
+    assert!(
+        observations[0].contains(&Event::Gap { from: 1, to: 3 }),
+        "renderer woke before the recovery Gap was queued: {observations:?}"
+    );
+    assert_eq!(*renderer.views.lock().unwrap(), vec![3], "version watch woke before the view was published");
+}

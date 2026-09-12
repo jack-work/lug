@@ -235,7 +235,8 @@ impl Follower {
     /// Handed out once; later calls return `None`. A consumer that stops
     /// reading loses events rather than slowing the view down, and what it
     /// lost arrives as an [`Event::Gap`] once it reads again, because a
-    /// silent jump in versions would be a lie.
+    /// silent jump in versions would be a lie. Recovery waits for room to
+    /// announce its gap before replacing the view.
     pub fn records(&mut self) -> Option<mpsc::Receiver<Event>> {
         self.records.lock().ok()?.take()
     }
@@ -430,15 +431,15 @@ impl Task {
                     // we raced a truncation; start the whole stream over.
                     return Ok(false);
                 }
-                self.adopt(view.version, &view.value)?;
                 // The gap the consumer is told about runs to where the view
                 // actually resumed, not to where the server said it would,
                 // because everything in between arrived inside the view.
                 self.emit(Event::Gap {
                     from,
-                    to: self.cursor,
+                    to: view.version,
                 })
                 .await;
+                self.adopt(view.version, &view.value)?;
                 Ok(true)
             }
             Err(e) if e.is_transient() => Ok(false),
@@ -449,20 +450,27 @@ impl Task {
     fn publish(&mut self, status: Status) {
         let snapshot = self.store.as_ref().map(|s| s.snapshot());
         let version = self.cursor;
-        let _ = self.versions.send(version);
         let _ = self.state.send(State {
             snapshot,
             version,
             reducible: self.mode == Mode::Reducible,
             status,
         });
+        // A renderer awakened by the version must find the matching view.
+        let _ = self.versions.send(version);
     }
 
-    /// Never blocks the fold: the view is maintained independently of whether
-    /// anyone is reading the event stream. What a stalled consumer missed is
-    /// handed to it as a gap, since a jump in versions it cannot see would be
-    /// a lie about contiguity.
+    /// Ordinary records may be dropped, but recovery must announce its gap
+    /// before a renderer can see the replacement view.
     async fn emit(&mut self, event: Event) {
+        if let Event::Gap { from, to } = event {
+            let from = self.dropped.take().map_or(from, |(lost, _)| lost.min(from));
+            tokio::select! {
+                _ = self.events.send(Event::Gap { from, to }) => {}
+                _ = self.state.closed() => {}
+            }
+            return;
+        }
         if let Some((from, to)) = self.dropped {
             if self.events.try_send(Event::Gap { from, to }).is_ok() {
                 self.dropped = None;
@@ -533,6 +541,42 @@ mod tests {
         let log_view = json!({ "view": { "version": 4, "root": document }, "synced": 4 });
         let parsed = snapshot_from(9, &log_view).expect("log view");
         assert_eq!(parsed.version(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_recovery_waits_for_room_to_queue_its_gap() {
+        let (state, _state_rx) = watch::channel(State {
+            snapshot: None,
+            version: 1,
+            reducible: true,
+            status: Status::Live,
+        });
+        let (versions, mut version_rx) = watch::channel(1);
+        let (events, mut event_rx) = mpsc::channel(1);
+        events.try_send(Event::Record(Record { version: 1, patch: json!({}) })).unwrap();
+        let mut task = Task {
+            hub: Hub::builder(crate::Transport::unix("/unused-gap-order-test")).connect_lazy(),
+            log: Arc::from("log"),
+            credit: 1,
+            state,
+            versions,
+            events,
+            dropped: Some((1, 2)),
+            cursor: 2,
+            store: None,
+            mode: Mode::Reducible,
+        };
+        let recovery = async {
+            task.emit(Event::Gap { from: 2, to: 4 }).await;
+            task.adopt(4, &json!({})).unwrap();
+        };
+        futures::pin_mut!(recovery);
+        assert!(futures::poll!(&mut recovery).is_pending(), "recovery published without room for its Gap");
+        assert!(!version_rx.has_changed().unwrap());
+        assert!(matches!(event_rx.try_recv(), Ok(Event::Record(_))));
+        recovery.await;
+        assert_eq!(event_rx.try_recv().unwrap(), Event::Gap { from: 1, to: 4 });
+        assert_eq!(*version_rx.borrow_and_update(), 4);
     }
 
     #[test]
