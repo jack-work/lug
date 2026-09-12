@@ -277,10 +277,18 @@ impl<V: Versioned> SegmentStore<V> {
                 Ok(ControlFlow::Continue(()))
             })?;
 
-            if scan.torn {
-                if index != last_index {
-                    return Err(Error::TornMidLog { path });
-                }
+            if scan.torn && index != last_index {
+                return Err(Error::TornMidLog { path });
+            }
+            // Not only for the torn tail. A crash can drop one page of an
+            // unflushed batch and keep the pages behind it, which leaves whole
+            // records above the hole the scan stopped at. Left in place they
+            // are unreachable only until the log appends back up to the offset
+            // one of them starts at, and then it reads as the very record the
+            // scan is expecting next. Cutting here, with preallocation putting
+            // zeroes back afterwards, is what makes the end of a segment mean
+            // the end.
+            if scan.file_len > scan.end {
                 truncate(&path, scan.end)?;
             }
             let segment = &mut self.segments[index];

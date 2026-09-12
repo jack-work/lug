@@ -71,6 +71,61 @@ fn poke(path: &Path, offset: u64, bytes: &[u8]) {
     file.write_all(bytes).expect("write");
 }
 
+/// Fixed width payload, so every record in a test occupies exactly 64 bytes
+/// and offsets can be reasoned about in records.
+fn wide(version: Version, mark: char) -> Bytes {
+    let mut body = format!("{mark} {version:>8} ").into_bytes();
+    body.resize(48, b'.');
+    Bytes::from(body)
+}
+
+fn wide_records(range: std::ops::RangeInclusive<Version>, mark: char) -> Vec<Record> {
+    range.map(|version| Record { version, patch: wide(version, mark) }).collect()
+}
+
+/// A power cut in the middle of an unflushed batch can drop one page and keep
+/// the ones behind it. Recovery stops at the hole, correctly, because none of
+/// that batch was ever acknowledged. What it must not do is leave the records
+/// above the hole sitting there: the log goes on appending, and when it lands
+/// on the offset one of those leftovers starts at, that leftover is a whole,
+/// correctly checksummed record at exactly the version the scan is expecting.
+#[test]
+fn a_crash_leaves_nothing_above_the_end_that_can_come_back() {
+    const RECORD: u64 = 64;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut wal = store(dir.path(), 1 << 16);
+    wal.append(&wide_records(1..=3, 'a')).expect("append");
+    wal.sync().expect("sync");
+
+    // Never flushed, so a crash is free to take any of it.
+    wal.append(&wide_records(4..=200, 'a')).expect("append");
+    let seg = segment_files(dir.path()).remove(0);
+    let end = PROLOGUE + 3 * RECORD;
+    lug_wal::fault::lose(&seg, end, 4096).expect("the first page of the batch was still dirty");
+    lug_wal::fault::clear();
+    drop(wal);
+
+    let mut wal = store(dir.path(), 1 << 16);
+    assert_eq!(versions(&wal.load().expect("load").tail), vec![1, 2, 3]);
+
+    // 4096 bytes of hole is 64 records, so the batch that fills it stops
+    // exactly where the first surviving leftover begins.
+    wal.append(&wide_records(4..=67, 'b')).expect("append after the crash");
+    wal.sync().expect("sync");
+    drop(wal);
+
+    let mut wal = store(dir.path(), 1 << 16);
+    let recovered = wal.load().expect("load");
+    assert_eq!(
+        versions(&recovered.tail),
+        (1..=67).collect::<Vec<_>>(),
+        "records that were never acknowledged came back from above the end"
+    );
+    for record in &recovered.tail[3..] {
+        assert_eq!(record.patch, wide(record.version, 'b'), "version {}", record.version);
+    }
+}
+
 /// The one that matters. A batch that fails partway has already put complete,
 /// correctly checksummed records on disk. If they are left above the logical
 /// end, the shorter batch that the caller retries with does not cover them,
