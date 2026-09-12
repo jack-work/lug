@@ -65,6 +65,11 @@ pub trait Storage: Send + 'static {
 
     /// Checkpoint the MVCC pointer. Records at or below `view.version()`
     /// become eligible for reclamation.
+    ///
+    /// A header is only allowed to become visible after the records it covers
+    /// are durable. It licenses recovery to skip them, so a crash that keeps
+    /// the header and loses those records leaves a checkpoint standing over
+    /// nothing.
     fn write_header(&mut self, view: &Self::View) -> Result<(), Self::Error>;
 
     /// Flush to stable storage. Returns once the bytes survive power loss.

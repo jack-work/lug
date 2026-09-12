@@ -120,6 +120,10 @@ pub enum Error {
         "{path} is poisoned: bytes above offset {offset} may replay as records nobody was told about, so appending is refused until the store is reopened"
     )]
     Poisoned { path: PathBuf, offset: u64 },
+    #[error("{dir} is already open: a log directory has exactly one writer")]
+    Locked { dir: PathBuf },
+    #[error("version {version} is the last the counter holds, and the log needs a version above it")]
+    Exhausted { version: Version },
 }
 
 impl Error {
@@ -177,6 +181,12 @@ impl<V: Versioned> SegmentStore<V> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir).map_err(Error::at(&dir))?;
         let dir_handle = File::open(&dir).map_err(Error::at(&dir))?;
+        // Each store keeps its own idea of where the records end, so a second
+        // one writes over the tail the first already acknowledged, and the
+        // records in between are lost with nothing to show for it.
+        if !sys::try_lock_dir(&dir_handle).map_err(Error::at(&dir))? {
+            return Err(Error::Locked { dir });
+        }
         let mut store = Self {
             dir,
             dir_handle,
@@ -277,10 +287,18 @@ impl<V: Versioned> SegmentStore<V> {
                 Ok(ControlFlow::Continue(()))
             })?;
 
-            if scan.torn {
-                if index != last_index {
-                    return Err(Error::TornMidLog { path });
-                }
+            if scan.torn && index != last_index {
+                return Err(Error::TornMidLog { path });
+            }
+            // Not only for the torn tail. A crash can drop one page of an
+            // unflushed batch and keep the pages behind it, which leaves whole
+            // records above the hole the scan stopped at. Left in place they
+            // are unreachable only until the log appends back up to the offset
+            // one of them starts at, and then it reads as the very record the
+            // scan is expecting next. Cutting here, with preallocation putting
+            // zeroes back afterwards, is what makes the end of a segment mean
+            // the end.
+            if scan.file_len > scan.end {
                 truncate(&path, scan.end)?;
             }
             let segment = &mut self.segments[index];
@@ -413,9 +431,14 @@ impl<V: Versioned> Storage for SegmentStore<V> {
                     max: format::MAX_PAYLOAD,
                 });
             }
-            expected += 1;
+            // Taking the top of the counter would leave the store with no
+            // next version to name, and every offset arithmetic below assumes
+            // one exists.
+            let Some(next) = expected.checked_add(1) else {
+                return Err(Error::Exhausted { version: record.version });
+            };
+            expected = next;
         }
-
         let rotating = match self.segments.last() {
             Some(segment) => segment.end >= self.rotate_bytes,
             None => true,
@@ -467,6 +490,12 @@ impl<V: Versioned> Storage for SegmentStore<V> {
     }
 
     fn write_header(&mut self, view: &V) -> Result<(), Error> {
+        // A header is a claim that recovery may skip every record below it, so
+        // those records have to be on stable storage before the name that
+        // covers them exists. Published first, it survives a crash that the
+        // records it stands over do not.
+        self.sync()?;
+
         let version = view.version();
         let json = serde_json::to_vec(&Header { version, view })?;
         let bytes = header_bytes(&json);
@@ -533,6 +562,6 @@ impl<V: Versioned> Storage for SegmentStore<V> {
     }
 
     fn oldest(&self) -> Version {
-        self.segments.first().map_or(self.header_version + 1, |s| s.first)
+        self.segments.first().map_or(self.header_version.saturating_add(1), |s| s.first)
     }
 }

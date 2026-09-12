@@ -22,6 +22,9 @@ pub(crate) struct Segment {
 
 pub(crate) struct Scan {
     pub end: u64,
+    /// Length of the file the scan walked, so a caller can tell whether
+    /// anything is sitting above the last record.
+    pub file_len: u64,
     /// Stopped on a short read or a bad checksum rather than at a boundary.
     /// Normal for the segment a crash was writing into, corruption anywhere
     /// else.
@@ -55,34 +58,34 @@ where
         match fill(&mut reader, &mut prefix).map_err(Error::at(path))? {
             // Nothing at all at a record boundary is the clean end of a
             // rotated segment, not damage.
-            0 => return Ok(Scan { end, torn: false }),
+            0 => return Ok(Scan { end, file_len, torn: false }),
             REC_PREFIX => {}
-            _ => return Ok(Scan { end, torn: true }),
+            _ => return Ok(Scan { end, file_len, torn: true }),
         }
         let (len, crc, version) = split_prefix(&prefix);
         // Zero is the end marker, which is what preallocation leaves and what
         // a failed append writes back over itself. Records carry at least one
         // byte so the two can never be confused.
         if len == 0 {
-            return Ok(Scan { end, torn: false });
+            return Ok(Scan { end, file_len, torn: false });
         }
         let room = file_len.saturating_sub(end + REC_PREFIX as u64);
         if len > MAX_PAYLOAD || u64::from(len) > room {
-            return Ok(Scan { end, torn: true });
+            return Ok(Scan { end, file_len, torn: true });
         }
 
         payload.clear();
         payload.resize(len as usize, 0);
         if fill(&mut reader, &mut payload).map_err(Error::at(path))? != len as usize {
-            return Ok(Scan { end, torn: true });
+            return Ok(Scan { end, file_len, torn: true });
         }
         if checksum(version, &payload) != crc {
-            return Ok(Scan { end, torn: true });
+            return Ok(Scan { end, file_len, torn: true });
         }
 
         end += (REC_PREFIX + payload.len()) as u64;
         if visit(version, &payload)?.is_break() {
-            return Ok(Scan { end, torn: false });
+            return Ok(Scan { end, file_len, torn: false });
         }
     }
 }

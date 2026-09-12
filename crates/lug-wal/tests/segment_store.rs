@@ -71,6 +71,61 @@ fn poke(path: &Path, offset: u64, bytes: &[u8]) {
     file.write_all(bytes).expect("write");
 }
 
+/// Fixed width payload, so every record in a test occupies exactly 64 bytes
+/// and offsets can be reasoned about in records.
+fn wide(version: Version, mark: char) -> Bytes {
+    let mut body = format!("{mark} {version:>8} ").into_bytes();
+    body.resize(48, b'.');
+    Bytes::from(body)
+}
+
+fn wide_records(range: std::ops::RangeInclusive<Version>, mark: char) -> Vec<Record> {
+    range.map(|version| Record { version, patch: wide(version, mark) }).collect()
+}
+
+/// A power cut in the middle of an unflushed batch can drop one page and keep
+/// the ones behind it. Recovery stops at the hole, correctly, because none of
+/// that batch was ever acknowledged. What it must not do is leave the records
+/// above the hole sitting there: the log goes on appending, and when it lands
+/// on the offset one of those leftovers starts at, that leftover is a whole,
+/// correctly checksummed record at exactly the version the scan is expecting.
+#[test]
+fn a_crash_leaves_nothing_above_the_end_that_can_come_back() {
+    const RECORD: u64 = 64;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut wal = store(dir.path(), 1 << 16);
+    wal.append(&wide_records(1..=3, 'a')).expect("append");
+    wal.sync().expect("sync");
+
+    // Never flushed, so a crash is free to take any of it.
+    wal.append(&wide_records(4..=200, 'a')).expect("append");
+    let seg = segment_files(dir.path()).remove(0);
+    let end = PROLOGUE + 3 * RECORD;
+    lug_wal::fault::lose(&seg, end, 4096).expect("the first page of the batch was still dirty");
+    lug_wal::fault::clear();
+    drop(wal);
+
+    let mut wal = store(dir.path(), 1 << 16);
+    assert_eq!(versions(&wal.load().expect("load").tail), vec![1, 2, 3]);
+
+    // 4096 bytes of hole is 64 records, so the batch that fills it stops
+    // exactly where the first surviving leftover begins.
+    wal.append(&wide_records(4..=67, 'b')).expect("append after the crash");
+    wal.sync().expect("sync");
+    drop(wal);
+
+    let mut wal = store(dir.path(), 1 << 16);
+    let recovered = wal.load().expect("load");
+    assert_eq!(
+        versions(&recovered.tail),
+        (1..=67).collect::<Vec<_>>(),
+        "records that were never acknowledged came back from above the end"
+    );
+    for record in &recovered.tail[3..] {
+        assert_eq!(record.patch, wide(record.version, 'b'), "version {}", record.version);
+    }
+}
+
 /// The one that matters. A batch that fails partway has already put complete,
 /// correctly checksummed records on disk. If they are left above the logical
 /// end, the shorter batch that the caller retries with does not cover them,
@@ -260,6 +315,37 @@ fn a_header_moves_where_replay_starts() {
     assert!(!dir.path().join("header.tmp").exists(), "the temporary header outlived the rename");
 }
 
+/// A checkpoint says "everything up to this version is in the view, do not
+/// bother replaying it". Publishing that by rename before the records it
+/// covers are on stable storage means a crash can leave the claim standing
+/// over records that are not there.
+#[test]
+fn a_checkpoint_is_not_published_before_the_records_it_covers() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut wal = store(dir.path(), 1 << 16);
+    wal.append(&records(1..=10)).expect("append");
+    wal.sync().expect("sync");
+
+    // Written, not flushed, which is the ordinary state of a log between
+    // syncs.
+    wal.append(&records(11..=20)).expect("append");
+    wal.write_header(&Mark(20)).expect("checkpoint");
+
+    let seg = segment_files(dir.path()).remove(0);
+    lug_wal::fault::lose_unsynced(&seg).expect("lose whatever had not reached the platter");
+    lug_wal::fault::clear();
+    drop(wal);
+
+    let mut wal = store(dir.path(), 1 << 16);
+    let Ok(recovered) = wal.load() else {
+        panic!("a header that outran its records left the log unopenable");
+    };
+    assert_eq!(recovered.header, Some(Mark(20)));
+    assert!(recovered.tail.is_empty(), "nothing is above the checkpoint");
+    assert_eq!(versions(&wal.read_after(10, 3).expect("read")), vec![11, 12, 13]);
+    wal.append(&records(21..=22)).expect("the log carries on above the checkpoint");
+}
+
 #[test]
 fn read_after_spans_segment_boundaries() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -382,4 +468,75 @@ fn a_segment_is_sized_before_it_is_written() {
     let meta = std::fs::metadata(segment_files(dir.path()).remove(0)).expect("stat");
     assert_eq!(meta.len(), 1 << 16, "the segment was not sized up front");
     assert!(meta.blocks() * 512 >= data_end(1, 3), "no blocks were reserved");
+}
+
+/// Segment names are the first version inside them, zero padded to eighteen
+/// digits, and the parser insists on exactly eighteen. A log that rotates at
+/// or above 10^18 therefore writes a segment whose name it cannot read back:
+/// on the next open the file is invisible, its records are gone, and the very
+/// next append opens it again and writes a fresh prologue over them.
+#[test]
+fn a_segment_named_past_eighteen_digits_is_still_found() {
+    const HIGH: Version = 999_999_999_999_999_998;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut wal = store(dir.path(), 32);
+    wal.write_header(&Mark(HIGH - 1)).expect("checkpoint the log up near the end of the counter");
+
+    // Rotation is per append here, so every version lands in a segment of its
+    // own and the third one crosses into nineteen digits.
+    for version in HIGH..=HIGH + 2 {
+        wal.append(&records(version..=version)).expect("append");
+    }
+    wal.sync().expect("sync");
+    assert_eq!(segment_files(dir.path()).len(), 3);
+    drop(wal);
+
+    let mut wal = store(dir.path(), 32);
+    let recovered = wal.load().expect("load");
+    assert_eq!(
+        versions(&recovered.tail),
+        (HIGH..=HIGH + 2).collect::<Vec<_>>(),
+        "an acknowledged record went missing with the segment holding it"
+    );
+    wal.append(&records(HIGH + 3..=HIGH + 3)).expect("append");
+    drop(wal);
+
+    let mut wal = store(dir.path(), 32);
+    assert_eq!(versions(&wal.load().expect("load").tail), (HIGH..=HIGH + 3).collect::<Vec<_>>());
+}
+
+/// Nothing stopped two stores from opening the same directory, and each one
+/// kept its own idea of where the records end. The second writes at the
+/// offset the first already used, so records the first acknowledged are
+/// overwritten and never come back.
+#[test]
+fn a_second_store_on_the_same_directory_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut first = store(dir.path(), 1 << 16);
+    first.append(&records(1..=3)).expect("append");
+    first.sync().expect("sync");
+
+    let err = SegmentStore::<Mark>::open_with(dir.path(), Options { rotate_bytes: 1 << 16 })
+        .err()
+        .expect("a log directory has exactly one writer");
+    assert!(matches!(err, Error::Locked { .. }), "{err}");
+
+    // The lock goes with the handle, so the next owner gets in.
+    drop(first);
+    let mut second = store(dir.path(), 1 << 16);
+    assert_eq!(versions(&second.load().expect("load").tail), vec![1, 2, 3]);
+}
+
+/// A record at the top of the counter leaves no next version, and the append
+/// path adds one to it while validating the batch. In release that wraps the
+/// expectation back to zero, and in debug it takes the process down.
+#[test]
+fn the_last_version_the_counter_holds_is_refused_rather_than_wrapping() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut wal = store(dir.path(), 1 << 16);
+    wal.write_header(&Mark(Version::MAX - 1)).expect("checkpoint at the end of the counter");
+
+    let err = wal.append(&records(Version::MAX..=Version::MAX)).expect_err("no room above it");
+    assert!(matches!(err, Error::Exhausted { version: Version::MAX }), "{err}");
+    assert_eq!(wal.oldest(), Version::MAX);
 }

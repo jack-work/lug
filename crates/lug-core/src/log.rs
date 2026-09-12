@@ -132,7 +132,9 @@ where
     /// On a storage failure the structure is truncated back to the watermark
     /// so that memory never leads the log, and the error is returned. Patches
     /// rejected by the structure abort the whole batch before anything is
-    /// written.
+    /// written. A sync that fails after the records are written is different:
+    /// the versions exist in the log, so they stay in memory too, and only the
+    /// durability claim is refused.
     pub fn append(
         &mut self,
         patches: &[D::Patch],
@@ -170,13 +172,16 @@ where
             return self.unwind(base, Error::Storage(e));
         }
         let top = records.last().expect("non-empty").version;
+        // Storage holds them now, so the watermark moves whether or not the
+        // flush below works. Unwinding for a failed sync would leave memory
+        // behind a log that already carries these versions, and the next
+        // append would mint versions the store has taken: it would refuse
+        // them, and go on refusing.
+        self.watermark = top;
         if durability == Durability::Durable {
-            if let Err(e) = self.storage.sync() {
-                return self.unwind(base, Error::Storage(e));
-            }
+            self.storage.sync().map_err(Error::Storage)?;
             self.synced = top;
         }
-        self.watermark = top;
         Ok(views)
     }
 
