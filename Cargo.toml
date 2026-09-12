@@ -1,14 +1,42 @@
-[package]
-name = "cavlc"
+[workspace]
+resolver = "3"
+members = [
+    "crates/cavlc",
+    "crates/cavlc-demo",
+    "crates/lug-core",
+    "crates/lug-proto",
+    "crates/lug-wal",
+    "crates/lug-server",
+    "crates/lug-client",
+    "crates/lug-tui",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Concurrent AVL control: immutable JSON snapshots and single-writer batches"
+license = "MIT"
 
-[workspace]
-members = ["demo"]
-resolver = "3"
+[workspace.dependencies]
+cavlc = { path = "crates/cavlc" }
+lug-core = { path = "crates/lug-core" }
+lug-proto = { path = "crates/lug-proto" }
+lug-wal = { path = "crates/lug-wal" }
+lug-client = { path = "crates/lug-client" }
 
-[dependencies]
+anyhow = "1"
+bytes = { version = "1", features = ["serde"] }
+crc32fast = "1.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

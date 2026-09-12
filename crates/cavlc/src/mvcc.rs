@@ -5,12 +5,21 @@ use std::sync::Arc;
 pub type Version = u64;
 
 /// An immutable root and the version it represents, copied together.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Snapshot {
     version: Version,
     root: Value,
 }
 impl Snapshot {
+    /// Import a detached snapshot, as recovered from a checkpoint header.
+    /// The root must be an object; the version is taken on trust.
+    pub fn new(version: Version, root: Value) -> Result<Self, Error> {
+        if root.as_object().is_none() {
+            return Err(Error::RootMustBeObject);
+        }
+        Ok(Self { version, root })
+    }
     pub fn version(&self) -> Version {
         self.version
     }
@@ -67,6 +76,8 @@ impl Batch {
 #[derive(Debug)]
 pub struct Store {
     owner: Arc<()>,
+    /// Version of `snapshots[0]`. Nonzero only after resuming a checkpoint.
+    base: Version,
     snapshots: Vec<Snapshot>,
     log: Vec<Commit>,
 }
@@ -86,6 +97,7 @@ impl Store {
         }
         Ok(Self {
             owner: Arc::new(()),
+            base: 0,
             snapshots: vec![Snapshot { version: 0, root }],
             log: Vec::new(),
         })
@@ -93,20 +105,54 @@ impl Store {
     pub fn snapshot(&self) -> Snapshot {
         self.snapshots.last().unwrap().clone()
     }
+    /// The oldest version still retained. Nonzero after a resume or truncate
+    /// below the base.
+    pub fn base(&self) -> Version {
+        self.base
+    }
     pub fn snapshot_at(&self, version: Version) -> Option<Snapshot> {
-        self.snapshots.get(usize::try_from(version).ok()?).cloned()
+        let index = usize::try_from(version.checked_sub(self.base)?).ok()?;
+        self.snapshots.get(index).cloned()
     }
     pub fn log(&self) -> &[Commit] {
         &self.log
     }
     /// Read the half-open version range (after, through]. Invalid bounds fail.
     pub fn patches_between(&self, after: Version, through: Version) -> Option<&[Commit]> {
-        if after > through {
+        if after > through || after < self.base {
             return None;
         }
-        self.log
-            .get(usize::try_from(after).ok()?..usize::try_from(through).ok()?)
+        let start = usize::try_from(after - self.base).ok()?;
+        let end = usize::try_from(through.checked_sub(self.base)?).ok()?;
+        self.log.get(start..end)
     }
+    /// Discard every version above `version`, making it current again.
+    /// O(discarded); retained snapshots keep sharing their structure. A
+    /// version that was never reached is a no-op. Outstanding batches based
+    /// on a discarded version are rejected on publication, as always.
+    pub fn truncate(&mut self, version: Version) {
+        let Some(keep) = version.checked_sub(self.base).and_then(|n| usize::try_from(n).ok())
+        else {
+            return;
+        };
+        if keep + 1 >= self.snapshots.len() {
+            return;
+        }
+        self.snapshots.truncate(keep + 1);
+        self.log.truncate(keep);
+    }
+
+    /// Resume from a checkpointed snapshot. Its version becomes the base, and
+    /// the returned store has no history below it.
+    pub fn resume(snapshot: Snapshot) -> Self {
+        Self {
+            owner: Arc::new(()),
+            base: snapshot.version,
+            snapshots: vec![snapshot],
+            log: Vec::new(),
+        }
+    }
+
     pub fn begin_batch(&self) -> Batch {
         let base = self.snapshot();
         Batch {
