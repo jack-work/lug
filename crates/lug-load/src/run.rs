@@ -28,6 +28,8 @@ pub struct Pool {
     pub peers: Vec<Peer>,
     events: mpsc::Receiver<Event>,
     pub traffic: Arc<Traffic>,
+    confirmations: HashMap<(usize, u64), u64>,
+    unconfirmed: HashSet<(usize, u64)>,
 }
 
 impl Pool {
@@ -70,10 +72,31 @@ impl Pool {
             peers,
             events: receiver,
             traffic: traffic.clone(),
+            confirmations: HashMap::new(),
+            unconfirmed: HashSet::new(),
         })
     }
 
-    async fn send(&self, peer: usize, request: Request) -> Result<()> {
+    fn expect(&mut self, peer: usize, request: &Request) {
+        if matches!(request, Request::Subscribe { .. } | Request::Credit { .. }) {
+            *self.confirmations.entry((peer, request.id())).or_default() += 1;
+        }
+        if matches!(request, Request::Subscribe { .. }) {
+            self.unconfirmed.insert((peer, request.id()));
+        }
+    }
+
+    fn try_send(&mut self, peer: usize, request: Request) -> Result<()> {
+        self.expect(peer, &request);
+        self.peers[peer].out.try_send(request).map_err(|e| {
+            error(format!(
+                "OVERLOAD: connection {peer} command queue: {e}; no samples dropped"
+            ))
+        })
+    }
+
+    async fn send(&mut self, peer: usize, request: Request) -> Result<()> {
+        self.expect(peer, &request);
         self.peers[peer]
             .out
             .send(request)
@@ -92,19 +115,43 @@ impl Pool {
                 event.peer
             )));
         }
+        let key = (event.peer, response.id());
+        if let Response::Ok { id } = &response {
+            let remaining = self.confirmations.get_mut(&key).ok_or_else(|| {
+                error(format!(
+                    "unexpected Ok for connection {}, id {id}",
+                    event.peer
+                ))
+            })?;
+            if *remaining == 0 {
+                return Err(error(format!(
+                    "duplicate Ok for connection {}, id {id}",
+                    event.peer
+                )));
+            }
+            *remaining -= 1;
+            self.unconfirmed.remove(&key);
+        }
+        if matches!(response, Response::Records { .. }) && self.unconfirmed.contains(&key) {
+            return Err(error(format!(
+                "stream {} pushed before subscription acknowledgement",
+                response.id()
+            )));
+        }
         Ok((event.peer, event.arrived, response))
     }
 
     pub async fn control(&mut self, request: Request, deadline: Duration) -> Result<Response> {
         let id = request.id();
+        let expects_ok = matches!(request, Request::Subscribe { .. } | Request::Credit { .. });
         timeout(deadline, async {
             self.send(0, request).await?;
             loop {
                 let (_, _, response) = self.next().await?;
-                if response.id() == id {
+                if response.id() == id && (expects_ok || !matches!(response, Response::Ok { .. })) {
                     return Ok(response);
                 }
-                if !matches!(response, Response::Pong { .. }) {
+                if !matches!(response, Response::Pong { .. } | Response::Ok { .. }) {
                     return Err(error(format!(
                         "unexpected control-phase response {response:?}"
                     )));
@@ -128,8 +175,8 @@ impl Pool {
                 )
                 .await?
             {
-                Response::Ack { versions, .. } if versions.is_empty() => {}
-                Response::End { .. } => {}
+                Response::Logs { logs, .. }
+                    if logs.len() == 1 && logs[0].name == *name && !logs[0].reducible => {}
                 other => {
                     return Err(error(format!(
                         "Create {name:?}: unexpected response {other:?}"
@@ -146,11 +193,11 @@ impl Pool {
                 self.send(peer, Request::Ping { id: CONTROL }).await?;
             }
             let mut waiting: HashSet<_> = (0..self.peers.len()).collect();
-            while !waiting.is_empty() {
+            while !waiting.is_empty() || self.confirmations.values().any(|n| *n > 0) {
                 let (peer, _, response) = self.next().await?;
                 match response {
                     Response::Pong { id: CONTROL } if waiting.remove(&peer) => {}
-                    Response::Pong { .. } => {}
+                    Response::Pong { .. } | Response::Ok { .. } => {}
                     other => {
                         return Err(error(format!(
                             "unexpected held-connection heartbeat response {other:?}"
@@ -204,6 +251,20 @@ pub async fn load(
     names: &[String],
     pid: Option<u32>,
 ) -> Result<Loaded> {
+    timeout(
+        cfg.duration + cfg.timeout * 2,
+        load_inner(pool, cfg, names, pid),
+    )
+    .await
+    .map_err(|_| error("load setup or completion exceeded its bounded deadline"))?
+}
+
+async fn load_inner(
+    pool: &mut Pool,
+    cfg: &Config,
+    names: &[String],
+    pid: Option<u32>,
+) -> Result<Loaded> {
     let mut ledger = Ledger::new(names.len(), cfg.patch_size, cfg.durability);
     let mut streams = HashMap::new();
     for (log, name) in names.iter().enumerate() {
@@ -248,10 +309,12 @@ pub async fn load(
         };
         tokio::select! {
             event = pool.next() => {
-                let (_, arrived, response) = event?;
+                let (observed_peer, arrived, response) = event?;
                 match response {
                     Response::Ack { id, versions, synced } => {
                         let sequence = id.checked_sub(APPEND_BASE).ok_or_else(|| error(format!("unknown append id {id}")))?;
+                        let expected_peer = (sequence as usize % lanes) % pool.peers.len();
+                        if observed_peer != expected_peer { return Err(error(format!("Ack {id} arrived on connection {observed_peer}, expected {expected_peer}"))); }
                         if !pending.remove(&sequence) { return Err(error(format!("unexpected or duplicate ack {id}"))); }
                         let intended = ledger.ack(sequence, &versions, synced)?;
                         metrics.append.record(intended, arrived)?;
@@ -260,17 +323,17 @@ pub async fn load(
                     }
                     Response::Records { id, records } => {
                         if id == STALLED { return Err(error("BACKPRESSURE FAILURE: zero-credit subscriber received records")); }
+                        if streams.get(&id) != Some(&observed_peer) { return Err(error(format!("stream {id} arrived on wrong connection {observed_peer}"))); }
                         let count = u32::try_from(records.len())?;
                         for intended in ledger.records(id, &records)? { metrics.delivery.record(intended, arrived)?; }
                         metrics.delivered += u64::from(count);
                         if arrived < end { metrics.in_window_deliveries += u64::from(count); }
                         let peer = *streams.get(&id).ok_or_else(|| error(format!("unknown stream {id}")))?;
                         // Keeping the command queue bounded makes a slow harness an explicit failure, not hidden heap growth.
-                        pool.peers[peer].out.try_send(Request::Credit { id, grant: count })
-                            .map_err(|e| error(format!("credit queue overloaded on connection {peer}: {e}")))?;
+                        pool.try_send(peer, Request::Credit { id, grant: count })?;
                         ledger.grant(id, count)?;
                     }
-                    Response::Pong { .. } => {}
+                    Response::Pong { .. } | Response::Ok { .. } => {}
                     Response::Gap { id, from, to } => return Err(error(format!("GAP: stream {id} lost ({from}, {to}] despite retention disabled"))),
                     other => return Err(error(format!("unexpected load response {other:?}"))),
                 }
@@ -284,7 +347,7 @@ pub async fn load(
                 let peer = lane % pool.peers.len();
                 let sequence = ledger.issue(log, due);
                 let request = Request::Append { id: APPEND_BASE + sequence, log: names[log].clone(), patches: vec![patch(sequence, cfg.patch_size)], durability: cfg.durability };
-                pool.peers[peer].out.try_send(request).map_err(|e| error(format!("OVERLOAD: connection {peer} command queue: {e}; no samples dropped")))?;
+                pool.try_send(peer, request)?;
                 pending.insert(sequence);
                 sent += 1;
                 metrics.scheduled += 1;
@@ -320,7 +383,7 @@ pub async fn cancel(pool: &mut Pool, loaded: &mut Loaded, deadline: Duration) ->
             let (_, _, response) = pool.next().await?;
             match response {
                 Response::End { id } if waiting.remove(&id) => {}
-                Response::End { .. } | Response::Pong { .. } => {}
+                Response::Pong { .. } | Response::Ok { .. } => {}
                 Response::Records { id, records } => {
                     loaded.ledger.records(id, &records)?;
                 }
@@ -383,13 +446,20 @@ pub async fn backpressure(endpoint: &Endpoint, cfg: &Config) -> Result<()> {
                 {
                     break;
                 }
-                Response::Pong { .. } => {}
+                Response::Pong { .. } | Response::Ok { .. } => {}
                 other => {
                     return Err(error(format!(
                         "stopped-credit stream failed its one-record resume: {other:?}"
                     )));
                 }
             }
+        }
+        pool.heartbeat(cfg.timeout).await?;
+        if let Ok(event) = timeout(Duration::from_millis(250), pool.next()).await {
+            let (_, _, response) = event?;
+            return Err(error(format!(
+                "BACKPRESSURE FAILURE: frame after one-record grant was exhausted: {response:?}"
+            )));
         }
         match pool
             .control(Request::Cancel { id: STALLED }, cfg.timeout)
@@ -409,6 +479,17 @@ pub async fn backpressure(endpoint: &Endpoint, cfg: &Config) -> Result<()> {
 }
 
 pub async fn replay(
+    endpoint: &Endpoint,
+    cfg: &Config,
+    names: &[String],
+    ledger: &mut Ledger,
+) -> Result<()> {
+    timeout(cfg.timeout * 2, replay_inner(endpoint, cfg, names, ledger))
+        .await
+        .map_err(|_| error("durable replay setup or completion exceeded its bounded deadline"))?
+}
+
+async fn replay_inner(
     endpoint: &Endpoint,
     cfg: &Config,
     names: &[String],
@@ -440,7 +521,7 @@ pub async fn replay(
                     pool.send(0, Request::Credit { id, grant: count }).await?;
                     ledger.grant(id, count)?;
                 }
-                Response::Pong { .. } => {}
+                Response::Pong { .. } | Response::Ok { .. } => {}
                 other => return Err(error(format!("DURABLE REPLAY FAILED: {other:?}"))),
             }
         }
@@ -457,6 +538,7 @@ pub async fn replay(
             other => return Err(error(format!("replay Cancel: {other:?}"))),
         }
     }
+    pool.heartbeat(cfg.timeout).await?;
     Ok(())
 }
 
@@ -516,6 +598,7 @@ pub async fn churn(endpoint: &Endpoint, cfg: &Config, names: &[String]) -> Resul
             Response::End { .. } => {}
             other => return Err(error(format!("churn Cancel: {other:?}"))),
         }
+        pool.heartbeat(cfg.timeout).await?;
     }
     Ok(())
 }

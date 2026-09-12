@@ -317,6 +317,9 @@ pub async fn connect(
                     stream.request(&endpoint, "GET", &path, None, &[]).await?;
                     let welcome = stream.event().await?;
                     validate_welcome(&welcome)?;
+                    if welcome.id() != *id {
+                        return Err(error("SSE Welcome returned the wrong stream id"));
+                    }
                     let Response::Welcome {
                         session: Some(session),
                         ..
@@ -324,6 +327,16 @@ pub async fn connect(
                     else {
                         return Err(error("SSE Welcome omitted session"));
                     };
+                    events
+                        .send(Event {
+                            peer: index,
+                            arrived: Instant::now(),
+                            response: Ok(Response::Ok { id: *id }),
+                        })
+                        .await
+                        .map_err(|_| {
+                            error("event receiver closed while acknowledging SSE Welcome")
+                        })?;
                     let events = events.clone();
                     let task = streams.spawn(async move {
                         loop {
@@ -353,7 +366,9 @@ pub async fn connect(
                             session
                         })
                     } else {
-                        sessions.get(&request.id()).map(|(session, _)| session.clone())
+                        sessions
+                            .get(&request.id())
+                            .map(|(session, _)| session.clone())
                     };
                     let response = call.call(&endpoint, session.as_deref(), &request).await?;
                     Ok(Some(response))

@@ -4,7 +4,7 @@ use crate::{
     error, run,
     wire::{Endpoint, read_frame},
 };
-use lug_proto::{Record, Request, Response};
+use lug_proto::{LogInfo, Record, Request, Response};
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -30,6 +30,8 @@ enum Fault {
     AckLoss,
     StallOnZeroCredit,
     IgnoreCredit,
+    MissingSubscribeAck,
+    DuplicateSubscribeAck,
 }
 
 struct Subscriber {
@@ -148,11 +150,16 @@ fn handle(
             session: None,
         })?,
         Request::Create { log, .. } => {
-            state.logs.entry(log).or_default();
-            out.try_send(Response::Ack {
+            let records = state.logs.entry(log.clone()).or_default();
+            out.try_send(Response::Logs {
                 id,
-                versions: vec![],
-                synced: 0,
+                logs: vec![LogInfo {
+                    name: log,
+                    reducible: false,
+                    version: records.len() as u64,
+                    oldest: 1,
+                    subscribers: 0,
+                }],
             })?;
         }
         Request::Append { log, patches, .. } => {
@@ -181,6 +188,12 @@ fn handle(
         Request::Subscribe {
             log, from, credit, ..
         } => {
+            if fault != Fault::MissingSubscribeAck {
+                out.try_send(Response::Ok { id })?;
+            }
+            if fault == Fault::DuplicateSubscribeAck {
+                out.try_send(Response::Ok { id })?;
+            }
             state.subscribers.push(Subscriber {
                 id,
                 connection,
@@ -198,6 +211,7 @@ fn handle(
                 .find(|s| s.connection == connection && s.id == id)
                 .ok_or_else(|| error("mock credit for absent stream"))?;
             subscriber.credit += grant;
+            out.try_send(Response::Ok { id })?;
             fanout(state, fault)?;
         }
         Request::Cancel { .. } => {
@@ -288,7 +302,14 @@ async fn mock_delay_appears_as_queueing_in_intended_time_histogram() {
 
 #[tokio::test]
 async fn injected_gaps_duplicates_order_changes_and_ack_loss_all_fail() {
-    for fault in [Fault::Gap, Fault::Duplicate, Fault::Order, Fault::AckLoss] {
+    for fault in [
+        Fault::Gap,
+        Fault::Duplicate,
+        Fault::Order,
+        Fault::AckLoss,
+        Fault::MissingSubscribeAck,
+        Fault::DuplicateSubscribeAck,
+    ] {
         assert!(exercise(fault, Duration::ZERO).await.is_err());
     }
 }
@@ -372,4 +393,177 @@ async fn held_connections_and_short_lived_accepts_are_separate_regimes() {
     assert_eq!(pool.peers.len(), 128);
     assert_eq!(run::accepts(&mock.endpoint, &cfg).await.unwrap().0, 64);
     pool.heartbeat(cfg.timeout).await.unwrap();
+}
+
+impl Mock {
+    async fn http() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Endpoint {
+            socket: PathBuf::new(),
+            http: Some(listener.local_addr().unwrap()),
+            token: Arc::new("test-only".to_owned()),
+        };
+        let state = Arc::new(Mutex::new(State::default()));
+        let shared = state.clone();
+        let task = tokio::spawn(async move {
+            let mut tasks = JoinSet::new();
+            let mut connection = 0;
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let shared = shared.clone();
+                tasks.spawn(async move {
+                    let _ = serve_http(socket, shared, connection).await;
+                });
+                connection += 1;
+            }
+        });
+        Self {
+            endpoint,
+            state,
+            directory: PathBuf::new(),
+            task,
+        }
+    }
+}
+
+async fn serve_http(
+    socket: tokio::net::TcpStream,
+    shared: Arc<Mutex<State>>,
+    connection: usize,
+) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+    let mut socket = BufReader::new(socket);
+    loop {
+        let mut first = String::new();
+        if socket.read_line(&mut first).await? == 0 {
+            return Ok(());
+        }
+        let mut length = 0;
+        let mut routed = connection;
+        let mut auth = false;
+        loop {
+            let mut line = String::new();
+            socket.read_line(&mut line).await?;
+            if line == "\r\n" {
+                break;
+            }
+            let (name, value) = line
+                .trim()
+                .split_once(':')
+                .ok_or_else(|| error("bad test HTTP header"))?;
+            if name.eq_ignore_ascii_case("content-length") {
+                length = value.trim().parse()?;
+            }
+            if name.eq_ignore_ascii_case("authorization") {
+                auth = value.trim() == "Bearer test-only";
+            }
+            if name.eq_ignore_ascii_case(lug_proto::http::SESSION_HEADER) {
+                routed = value
+                    .trim()
+                    .strip_prefix("test-")
+                    .ok_or_else(|| error("missing test session"))?
+                    .parse()?;
+            }
+        }
+        assert!(auth);
+        let mut body = vec![0; length];
+        socket.read_exact(&mut body).await?;
+        let (out, mut responses) = mpsc::channel(4096);
+        if first.starts_with("GET ") {
+            let query = first
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .split_once('?')
+                .unwrap()
+                .1;
+            let args: HashMap<_, _> = query
+                .split('&')
+                .map(|part| part.split_once('=').unwrap())
+                .collect();
+            let id = args["id"].parse()?;
+            handle(
+                &mut *shared.lock().await,
+                Request::Subscribe {
+                    id,
+                    log: args["log"].to_owned(),
+                    from: args["from"].parse()?,
+                    mode: lug_proto::Mode::Records,
+                    credit: args["credit"].parse()?,
+                },
+                connection,
+                &out,
+                Fault::None,
+            )?;
+            assert_eq!(responses.recv().await.unwrap(), Response::Ok { id });
+            socket.get_mut().write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await?;
+            let welcome = Response::Welcome {
+                id,
+                version: lug_proto::VERSION,
+                max_frame: lug_proto::MAX_FRAME,
+                session: Some(format!("test-{connection}")),
+            };
+            http_event(socket.get_mut(), &welcome).await?;
+            drop(out);
+            while let Some(response) = responses.recv().await {
+                http_event(socket.get_mut(), &response).await?;
+            }
+            socket.get_mut().write_all(b"0\r\n\r\n").await?;
+            return Ok(());
+        }
+        assert!(first.starts_with("POST /v1/call HTTP/1.1"));
+        let request: Request = serde_json::from_slice(&body)?;
+        handle(
+            &mut *shared.lock().await,
+            request,
+            routed,
+            &out,
+            Fault::None,
+        )?;
+        let response = responses
+            .recv()
+            .await
+            .ok_or_else(|| error("test call not answered"))?;
+        let json = serde_json::to_vec(&response)?;
+        socket.get_mut().write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n", json.len()).as_bytes()).await?;
+        socket.get_mut().write_all(&json).await?;
+    }
+}
+
+async fn http_event(socket: &mut tokio::net::TcpStream, response: &Response) -> Result<()> {
+    let event = format!("data: {}\n\n", serde_json::to_string(response)?);
+    socket
+        .write_all(format!("{:x}\r\n{event}\r\n", event.len()).as_bytes())
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_sessions_carry_credit_cancel_and_exact_replay() {
+    let mock = Mock::http().await;
+    let cfg = Config {
+        transport: crate::config::Transport::Http,
+        rate: 20,
+        duration: Duration::from_millis(200),
+        timeout: Duration::from_secs(5),
+        ..config()
+    };
+    let names = vec!["one".to_owned(), "two".to_owned()];
+    let mut pool = run::Pool::open(&mock.endpoint, 1, 1, cfg.timeout)
+        .await
+        .unwrap();
+    pool.create(&names, cfg.timeout).await.unwrap();
+    let mut loaded = run::load(&mut pool, &cfg, &names, None).await.unwrap();
+    run::cancel(&mut pool, &mut loaded, cfg.timeout)
+        .await
+        .unwrap();
+    pool.heartbeat(cfg.timeout).await.unwrap();
+    assert_eq!(loaded.metrics.acknowledged, 4);
+    assert_eq!(loaded.metrics.delivered, 12);
+    run::replay(&mock.endpoint, &cfg, &names, &mut loaded.ledger)
+        .await
+        .unwrap();
+    assert!(mock.state.lock().await.subscribers.is_empty());
 }

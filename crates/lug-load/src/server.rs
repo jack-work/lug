@@ -215,12 +215,13 @@ impl Server {
     }
 
     pub async fn crash_restart(&mut self) -> Result<()> {
-        let mut child = self
+        let child = self
             .child
-            .take()
+            .as_mut()
             .ok_or_else(|| error("cannot crash absent server"))?;
         child.kill()?;
         let status = child.wait()?;
+        self.child = None;
         use std::os::unix::process::ExitStatusExt;
         if status.signal() != Some(libc::SIGKILL) {
             return Err(error(format!("crash expected SIGKILL, got {status}")));
