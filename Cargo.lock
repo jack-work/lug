@@ -531,9 +531,13 @@ name = "lug-wal"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "crc32fast",
  "lug-core",
+ "lug-wal",
+ "rustix",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
 ]
 

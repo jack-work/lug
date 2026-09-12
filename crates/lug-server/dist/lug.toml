@@ -1,0 +1,49 @@
+# /etc/lug/lug.toml
+#
+# Every key here has a command line flag of the same name, so a one-off run
+# can override the file without editing it.
+
+# Segment directories, one per log.
+data = "/var/lib/lug"
+
+# Created 0700 before the socket is bound, so the parent directory enforces
+# access whatever the umask does.
+run = "/run/lug"
+
+# Relative to run.
+socket = "lug.sock"
+
+# Loopback only. Omit the key to disable HTTP entirely.
+http = "127.0.0.1:7717"
+
+# Bearer token, read once at startup and never logged. Keep it 0600.
+token = "/etc/lug/token"
+
+# Uids allowed in beyond the daemon's own. Each still needs a per-log entry
+# below to reach anything.
+allow_uid = []
+
+segment = "64MiB"
+
+# Records held in memory per log for fan-out. A subscriber that falls behind
+# this reads from the segments instead.
+ring = 4096
+
+# Versions between automatic checkpoints. 0 disables them, leaving recovery
+# to replay every record.
+checkpoint_every = 10000
+
+# Per-log access, consulted only for uids listed in allow_uid.
+# [acl]
+# orders = [1001]
+
+# Queue bounds. The defaults suit a busy local daemon; lower them on a small
+# machine, since each is a ceiling on heap a client can make the daemon hold.
+# [limits]
+# inbox = 4096        # commands queued to one log actor
+# batch = 1024        # patches folded into one group commit
+# outbox = 1024       # frames queued toward one connection
+# pending = 1024      # replies one connection may await at once
+# push = 512          # records in one pushed frame
+# push_bytes = 4194304
+# connections = 1024

@@ -1,0 +1,43 @@
+[Unit]
+Description=lug, a local append-only log daemon
+Documentation=man:lug-server(8)
+After=network.target
+
+[Service]
+# Foreground, no forking and no notify protocol: the unit is ready when the
+# process is, and systemd owns the lifecycle.
+Type=exec
+ExecStart=/usr/bin/lug-server --config /etc/lug/lug.toml
+User=lug
+Group=lug
+Restart=on-failure
+RestartSec=1s
+# SIGTERM stops accepting, checkpoints every log and unlinks the socket.
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+# /run/lug and /var/lib/lug, owned by the daemon and nobody else. The socket
+# lives inside the first, so its parent enforces access.
+RuntimeDirectory=lug
+RuntimeDirectoryMode=0700
+StateDirectory=lug
+StateDirectoryMode=0700
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET
+RestrictNamespaces=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
