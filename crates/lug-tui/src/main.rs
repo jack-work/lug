@@ -114,9 +114,10 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>> {
     // A script names its log in the footer after the file, since there is no
     // daemon to have named it.
     let name = name.unwrap_or_else(|| match &source {
-        Source::Script(path) => {
-            path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "log".into())
-        }
+        Source::Script(path) => path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "log".into()),
         Source::Socket(_) => "log".into(),
     });
     Ok(Some(Args { source, reducible, name }))
