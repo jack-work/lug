@@ -17,6 +17,10 @@ use tokio_util::codec::Framed;
 
 /// Create the run directory 0700 and bind inside it, so the parent enforces
 /// access whatever the umask does to the socket itself.
+///
+/// The socket is bound under a private name and renamed into place, so the
+/// published path never points at a dead socket: a client restarting the
+/// daemon sees the old one until the moment the new one is listening.
 pub fn bind(run: &Path, socket: &Path) -> io::Result<(UnixListener, PathBuf)> {
     match std::fs::DirBuilder::new().recursive(true).mode(0o700).create(run) {
         Ok(()) => {}
@@ -26,13 +30,17 @@ pub fn bind(run: &Path, socket: &Path) -> io::Result<(UnixListener, PathBuf)> {
     std::fs::set_permissions(run, std::fs::Permissions::from_mode(0o700))?;
 
     let path = run.join(socket);
-    match std::fs::remove_file(&path) {
+    let mut staging = path.clone().into_os_string();
+    staging.push(format!(".{}", std::process::id()));
+    let staging = PathBuf::from(staging);
+    match std::fs::remove_file(&staging) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    let listener = UnixListener::bind(&path)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    let listener = UnixListener::bind(&staging)?;
+    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::rename(&staging, &path)?;
     Ok((listener, path))
 }
 

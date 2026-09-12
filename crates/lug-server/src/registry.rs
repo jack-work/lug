@@ -118,6 +118,10 @@ impl<F: StorageFactory> Logs for Registry<F> {
             subscribers: AtomicU32::new(0),
         });
 
+        self.factory
+            .remember(name, reducible)
+            .map_err(|e| Failure::new(Code::Storage, e))?;
+
         let factory = self.factory.clone();
         let owned = name.to_string();
         let batch = self.limits.batch;

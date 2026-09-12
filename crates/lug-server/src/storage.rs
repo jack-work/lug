@@ -16,7 +16,81 @@ pub trait StorageFactory: Send + Sync + 'static {
 
     fn plain(&self, log: &str) -> Result<Self::Plain, Self::Error>;
     fn reducible(&self, log: &str) -> Result<Self::Reducible, Self::Error>;
+
+    /// Record the shape of a new log, so a restart reopens it the same way.
+    fn remember(&self, log: &str, reducible: bool) -> Result<(), Self::Error> {
+        let _ = (log, reducible);
+        Ok(())
+    }
+
+    /// Logs already on disk and the shape each was created with. A daemon
+    /// that forgot these would answer NoSuchLog for data it is holding.
+    fn discover(&self) -> Result<Vec<(String, bool)>, Self::Error> {
+        Ok(Vec::new())
+    }
 }
+
+/// Segment files under `<data>/<log>`, one directory per log.
+#[derive(Debug, Clone)]
+pub struct Segments {
+    root: std::path::PathBuf,
+    options: lug_wal::Options,
+}
+
+impl Segments {
+    pub fn new(root: impl Into<std::path::PathBuf>, rotate_bytes: u64) -> Self {
+        Self { root: root.into(), options: lug_wal::Options { rotate_bytes } }
+    }
+}
+
+impl StorageFactory for Segments {
+    type Plain = lug_wal::SegmentStore<Tick>;
+    type Reducible = lug_wal::SegmentStore<Snapshot>;
+    type Error = lug_wal::Error;
+
+    fn plain(&self, log: &str) -> Result<Self::Plain, Self::Error> {
+        lug_wal::SegmentStore::open_with(self.root.join(log), self.options)
+    }
+
+    fn reducible(&self, log: &str) -> Result<Self::Reducible, Self::Error> {
+        lug_wal::SegmentStore::open_with(self.root.join(log), self.options)
+    }
+
+    fn remember(&self, log: &str, reducible: bool) -> Result<(), Self::Error> {
+        let dir = self.root.join(log);
+        std::fs::create_dir_all(&dir)?;
+        let kind = if reducible { "reducible\n" } else { "plain\n" };
+        let tmp = dir.join("kind.tmp");
+        std::fs::write(&tmp, kind)?;
+        std::fs::rename(&tmp, dir.join(KIND))?;
+        Ok(())
+    }
+
+    fn discover(&self) -> Result<Vec<(String, bool)>, Self::Error> {
+        let mut found = Vec::new();
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(found),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let kind = std::fs::read_to_string(entry.path().join(KIND)).unwrap_or_default();
+            found.push((name, kind.trim() == "reducible"));
+        }
+        found.sort();
+        Ok(found)
+    }
+}
+
+/// Names the data structure a log folds with, next to its segments.
+const KIND: &str = "kind";
 
 /// Storage that keeps the last `retain` records in memory and forgets the
 /// rest, so retention and `Gap` are exercised without touching a disk.

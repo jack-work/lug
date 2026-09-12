@@ -20,7 +20,7 @@ mod unix;
 pub use actor::{Failure, Metrics};
 pub use config::{Config, Limits};
 pub use registry::{LogHandle, Logs};
-pub use storage::{Memory, MemoryFactory, StorageFactory};
+pub use storage::{Memory, MemoryFactory, Segments, StorageFactory};
 
 use acl::Acl;
 use anyhow::Context;
@@ -58,15 +58,22 @@ impl Server {
             .collect();
         let acl = Arc::new(acl);
 
+        // Bind before anything slower, so a restart publishes a live socket
+        // as early as it can.
+        let (listener, socket) = unix::bind(&config.run, &config.socket)
+            .with_context(|| format!("binding {:?}", config.socket_path()))?;
+
         std::fs::create_dir_all(&config.data)
             .with_context(|| format!("creating data dir {:?}", config.data))?;
 
+        let existing = factory.discover().context("listing logs on disk")?;
         let registry =
             Registry::new(factory, Cores::new(cores)?, limits, config.checkpoint_every);
         let logs: Arc<dyn Logs> = Arc::new(registry);
-
-        let (listener, socket) = unix::bind(&config.run, &config.socket)
-            .with_context(|| format!("binding {:?}", config.socket_path()))?;
+        for (name, reducible) in existing {
+            logs.create(&name, reducible)
+                .map_err(|e| anyhow::anyhow!("reopening log {name}: {e}"))?;
+        }
         let (shutdown, stopping) = watch::channel(false);
         let mut tasks = Vec::new();
         tasks.push(tokio::spawn(unix::accept(unix::Accept {

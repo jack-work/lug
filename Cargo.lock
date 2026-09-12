@@ -504,6 +504,7 @@ dependencies = [
  "libc",
  "lug-core",
  "lug-proto",
+ "lug-wal",
  "serde",
  "serde_json",
  "tempfile",

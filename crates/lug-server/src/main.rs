@@ -1,8 +1,8 @@
 //! `lug-server`: foreground, logs to stderr, never forks. The supervisor owns
 //! the process.
 
-use lug_server::config::{Config, Error};
-use lug_server::{MemoryFactory, Server};
+use lug_server::config::Config;
+use lug_server::{Segments, Server};
 use tokio::signal::unix::{SignalKind, signal};
 
 fn main() -> anyhow::Result<()> {
@@ -35,11 +35,8 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run(config: Config) -> anyhow::Result<()> {
-    // Segment storage lands with lug-wal; until then logs live in memory and
-    // say so, rather than pretending to be durable.
-    tracing::warn!(data = ?config.data, "in-memory storage: records do not survive a restart");
-    let retain = config.limits.inbox.max(config.ring * 16);
-    let server = Server::start(config, MemoryFactory::new(retain)).await?;
+    let storage = Segments::new(config.data.clone(), config.segment.0);
+    let server = Server::start(config, storage).await?;
     tracing::info!(socket = ?server.socket(), http = ?server.http(), "lug-server ready");
 
     let mut term = signal(SignalKind::terminate())?;
@@ -52,5 +49,3 @@ async fn run(config: Config) -> anyhow::Result<()> {
     tracing::info!("stopped");
     Ok(())
 }
-
-const _: fn() -> Error = || Error::Invalid(String::new());
